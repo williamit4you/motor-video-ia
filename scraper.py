@@ -147,10 +147,66 @@ def get_dynamic_config():
 
 # ─── SCRAPING ─────────────────────────────────────────────────────────────────
 
+def is_article_link(href: str, base_url: str) -> bool:
+    """Retorna True se o link parece ser um artigo real, não uma seção/paginador."""
+    # Exclui paginadores
+    if '/pagina/' in href or '/page/' in href:
+        return False
+    # Exclui seções puras (poucos segmentos de path)
+    from urllib.parse import urlparse
+    parsed = urlparse(href)
+    path_parts = [p for p in parsed.path.strip('/').split('/') if p]
+    # Artigos geralmente têm ≥2 segmentos e o último é um slug (contém hífen ou número)
+    if len(path_parts) < 2:
+        return False
+    last_part = path_parts[-1]
+    if '-' not in last_part and not any(c.isdigit() for c in last_part):
+        return False
+    return True
+
+def fetch_rss(url: str) -> list:
+    """Tenta parsear a URL como RSS/Atom feed. Retorna lista de links de artigos."""
+    try:
+        import xml.etree.ElementTree as ET
+        headers = {"User-Agent": "Mozilla/5.0"}
+        res = requests.get(url, headers=headers, timeout=10)
+        if res.status_code != 200:
+            return []
+        root = ET.fromstring(res.content)
+        ns = {'atom': 'http://www.w3.org/2005/Atom'}
+        links = []
+        # RSS 2.0
+        for item in root.findall('.//item'):
+            link = item.findtext('link')
+            if link and link.startswith('http'):
+                links.append(link.strip())
+        # Atom
+        for entry in root.findall('.//atom:entry', ns):
+            link_el = entry.find('atom:link', ns)
+            if link_el is not None:
+                href = link_el.get('href', '')
+                if href.startswith('http'):
+                    links.append(href.strip())
+        return links[:5]
+    except Exception:
+        return []
+
 def fetch_and_parse(url: str) -> list:
-    """Acessa a página-fonte e extrai links de artigos."""
+    """Acessa a página-fonte e extrai links de artigos reais."""
     log_pipeline("FETCH", f"🌐 Acessando fonte: {url}")
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    
+    # Tenta RSS primeiro (mais confiável que scraping)
+    rss_links = fetch_rss(url)
+    if rss_links:
+        log_pipeline("FETCH", f"📡 RSS detectado! {len(rss_links)} artigo(s) encontrados")
+        return rss_links[:3]
+    
+    # Fallback: scraping HTML
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "pt-BR,pt;q=0.9",
+    }
     try:
         response = requests.get(url, headers=headers, timeout=15)
         log_pipeline("FETCH", f"📡 HTTP {response.status_code} — {len(response.text)} chars recebidos")
@@ -160,20 +216,35 @@ def fetch_and_parse(url: str) -> list:
             return []
 
         soup = BeautifulSoup(response.text, "html.parser")
-        all_links = soup.select('a')
+        all_links = soup.select('a[href]')
         log_pipeline("FETCH", f"🔗 {len(all_links)} links totais encontrados na página")
 
-        links = []
-        for a in all_links[:50]:
-            href = a.get('href', '')
-            if href and any(kw in href for kw in ['noticia', 'tecnologia', 'tudo-sobre', 'cnnbrasil', '/tech/', '/ia/', '/inteligencia']):
-                if href.startswith('/'):
-                    href = urljoin(url, href)
-                if href.startswith('http'):
-                    links.append(href)
+        ARTICLE_KEYWORDS = [
+            '/noticia/', '/noticias/', '/tecnologia/', '/tech/', 
+            '/ia/', '/inteligencia', '/tudo-sobre/', '/mundo/',
+            '/economia/', '/ciencia/', '/inovacao/'
+        ]
 
-        unique = list(set(links))[:3]
-        log_pipeline("FETCH", f"✅ {len(unique)} link(s) válido(s) selecionados para processar")
+        links = []
+        for a in all_links:
+            href = a.get('href', '')
+            if not href:
+                continue
+            # Normaliza URL
+            if href.startswith('/'):
+                href = urljoin(url, href)
+            if not href.startswith('http'):
+                continue
+            # Verifica keywords
+            if not any(kw in href for kw in ARTICLE_KEYWORDS):
+                continue
+            # Verifica se é artigo real (não paginador/seção)
+            if not is_article_link(href, url):
+                continue
+            links.append(href)
+
+        unique = list(dict.fromkeys(links))[:3]  # preserva ordem, remove duplas
+        log_pipeline("FETCH", f"✅ {len(unique)} artigo(s) válido(s) selecionados")
         return unique
 
     except requests.Timeout:
@@ -186,28 +257,40 @@ def fetch_and_parse(url: str) -> list:
 def read_article_text(article_url: str) -> str:
     """Lê o texto completo de um artigo."""
     log_pipeline("FETCH", f"📰 Lendo artigo: {article_url[:80]}")
-    headers = {"User-Agent": "Mozilla/5.0"}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "pt-BR,pt;q=0.9",
+        "Referer": "https://www.google.com/",
+    }
     try:
         res = requests.get(article_url, headers=headers, timeout=15)
         log_pipeline("FETCH", f"📡 HTTP {res.status_code} — {len(res.text)} chars do artigo")
 
+        if res.status_code == 403:
+            log_pipeline("FETCH", f"❌ HTTP 403 — site bloqueia bots. Tente adicionar o RSS dessa fonte.", "ERROR")
+            return ""
         if res.status_code != 200:
             log_pipeline("FETCH", f"❌ HTTP {res.status_code} ao ler artigo", "ERROR")
             return ""
 
         soup = BeautifulSoup(res.text, "html.parser")
 
-        # Remove scripts/styles
-        for tag in soup(["script", "style", "nav", "footer", "header"]):
+        # Remove ruído navegacional
+        for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form"]):
             tag.decompose()
 
-        paragraphs = soup.find_all('p')
-        full_text = " ".join([p.get_text(strip=True) for p in paragraphs if len(p.get_text(strip=True)) > 20])
+        # Tenta extrair pelo article tag primeiro
+        article_tag = soup.find('article')
+        source = article_tag if article_tag else soup
+
+        paragraphs = source.find_all('p')
+        full_text = " ".join([p.get_text(strip=True) for p in paragraphs if len(p.get_text(strip=True)) > 30])
 
         log_pipeline("FETCH", f"📄 Texto extraído: {len(full_text)} caracteres, {len(paragraphs)} parágrafos")
 
         if len(full_text) < 300:
-            log_pipeline("FETCH", f"⚠️ Texto muito curto ({len(full_text)} chars) — provavelmente paywall ou página vazia", "WARN")
+            log_pipeline("FETCH", f"⚠️ Texto curto ({len(full_text)} chars) — paywall ou página vazia", "WARN")
 
         return full_text
 
