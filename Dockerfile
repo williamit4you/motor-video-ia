@@ -1,32 +1,38 @@
-# Usa Python 3.10 leve
+# Imagem base com Python 3.10 + ffmpeg pré-instalado
+# Muito menor que instalar ffmpeg do apt (evita 200+ pacotes extras)
+FROM jrottenberg/ffmpeg:6.1-ubuntu2204 AS ffmpeg-base
+
 FROM python:3.10-slim
 
-# 1. Instala dependências do Sistema Operacional (FFMPEG, ImageMagick, Ghostscript, Git)
-RUN apt-get update && apt-get install -y \
-    ffmpeg \
+# Copia apenas os binários do ffmpeg da imagem especializada
+COPY --from=ffmpeg-base /usr/local/bin/ffmpeg /usr/local/bin/ffmpeg
+COPY --from=ffmpeg-base /usr/local/bin/ffprobe /usr/local/bin/ffprobe
+COPY --from=ffmpeg-base /usr/local/lib/ /usr/local/lib/
+
+# Instala APENAS o essencial (sem ffmpeg via apt)
+RUN apt-get update && apt-get install -y --no-install-recommends \
     imagemagick \
     ghostscript \
-    git \
     fonts-liberation \
-    libgl1 \
-    && rm -rf /var/lib/apt/lists/*
+    libgl1-mesa-glx \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
-# Fix para o MoviePy no Debian/Ubuntu: liberar política de segurança do ImageMagick
-RUN sed -i '/<policy domain="path" rights="none" pattern="@\*"/d' /etc/ImageMagick*/policy.xml
+# Fix de segurança do ImageMagick (permite PDF/vídeo)
+RUN sed -i 's/rights="none" pattern="PDF"/rights="read|write" pattern="PDF"/' /etc/ImageMagick-6/policy.xml || true
 
-# Define pasta de trabalho
 WORKDIR /app
 
-# 3. Copia e instala as libs do Python
+# Instala dependências Python
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt \
+    && pip cache purge
 
-# 4. Copia todo o código da pasta worker para dentro do container
+# Copia código
 COPY . .
 
-# 5. Cria as pastas de output para não dar erro de permissão no Motor de Vídeo
+# Pastas de output
 RUN mkdir -p temp_uploads temp_outputs
 
-# 6. Comando para iniciar o servidor (Porta 80)
-# Ajustado de main:app para video:app que é o nome do seu arquivo real!
-CMD ["uvicorn", "video:app", "--host", "0.0.0.0", "--port", "80"]
+# Roda os dois processos: video API na porta 80 + scraper daemon
+# Usa um script de entrypoint para iniciar ambos
+CMD uvicorn video:app --host 0.0.0.0 --port 80 & python scraper.py & wait
