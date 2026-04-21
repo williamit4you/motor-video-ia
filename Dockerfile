@@ -22,8 +22,13 @@ RUN sed -i 's/rights="none" pattern="PDF"/rights="read|write" pattern="PDF"/' /e
 
 WORKDIR /app
 
-# Instala dependências Python
+# Copia os requisitos
 COPY requirements.txt .
+
+# 1º Passo (NOVO): Força a instalação do PyTorch apenas para CPU (economiza ~2.5GB de disco)
+RUN pip install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+
+# 2º Passo: Instala as dependências do projeto
 RUN pip install --no-cache-dir -r requirements.txt \
     && pip cache purge
 
