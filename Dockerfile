@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     imagemagick \
     ghostscript \
     fonts-liberation \
-    libgl1-mesa-glx \
+    libgl1 \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 # Fix de segurança do ImageMagick (permite PDF/vídeo)
