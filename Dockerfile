@@ -4,10 +4,14 @@ FROM jrottenberg/ffmpeg:6.1-ubuntu2204 AS ffmpeg-base
 
 FROM python:3.10-slim
 
-# Copia apenas os binários do ffmpeg da imagem especializada
+# Copia binários do ffmpeg da imagem Ubuntu 22.04
 COPY --from=ffmpeg-base /usr/local/bin/ffmpeg /usr/local/bin/ffmpeg
 COPY --from=ffmpeg-base /usr/local/bin/ffprobe /usr/local/bin/ffprobe
 COPY --from=ffmpeg-base /usr/local/lib/ /usr/local/lib/
+
+# Copia as libs SSL 1.1 do Ubuntu 22.04 (Debian trixie usa OpenSSL 3.x, incompatível)
+COPY --from=ffmpeg-base /usr/lib/x86_64-linux-gnu/libssl.so.1.1 /usr/lib/x86_64-linux-gnu/libssl.so.1.1
+COPY --from=ffmpeg-base /usr/lib/x86_64-linux-gnu/libcrypto.so.1.1 /usr/lib/x86_64-linux-gnu/libcrypto.so.1.1
 
 # Instala APENAS o essencial (sem ffmpeg via apt)
 RUN apt-get update && apt-get install -y --no-install-recommends \
