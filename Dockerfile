@@ -1,49 +1,35 @@
-# Imagem base com Python 3.10 + ffmpeg pré-instalado
-# Muito menor que instalar ffmpeg do apt (evita 200+ pacotes extras)
-FROM jrottenberg/ffmpeg:6.1-ubuntu2204 AS ffmpeg-base
-
+# Usa Python 3.10 leve
 FROM python:3.10-slim
 
-# Copia binários do ffmpeg da imagem Ubuntu 22.04
-COPY --from=ffmpeg-base /usr/local/bin/ffmpeg /usr/local/bin/ffmpeg
-COPY --from=ffmpeg-base /usr/local/bin/ffprobe /usr/local/bin/ffprobe
-COPY --from=ffmpeg-base /usr/local/lib/ /usr/local/lib/
-
-# Copia as libs SSL 1.1 do Ubuntu 22.04 (Debian trixie usa OpenSSL 3.x, incompatível)
-COPY --from=ffmpeg-base /usr/lib/x86_64-linux-gnu/libssl.so.1.1 /usr/lib/x86_64-linux-gnu/libssl.so.1.1
-COPY --from=ffmpeg-base /usr/lib/x86_64-linux-gnu/libcrypto.so.1.1 /usr/lib/x86_64-linux-gnu/libcrypto.so.1.1
-
-# Instala APENAS o essencial (sem ffmpeg via apt)
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# 1. Instala dependências do Sistema Operacional (FFMPEG, ImageMagick, Git)
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
     imagemagick \
     ghostscript \
+    git \
     fonts-liberation \
     libgl1 \
-    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+    && rm -rf /var/lib/apt/lists/*
 
-# Fix de segurança do ImageMagick (permite PDF/vídeo)
-RUN sed -i 's/rights="none" pattern="PDF"/rights="read|write" pattern="PDF"/' /etc/ImageMagick-6/policy.xml || true
+# Fix para ImageMagick: libera política de segurança
+RUN sed -i '/<policy domain="path" rights="none" pattern="@\*"/d' /etc/ImageMagick*/policy.xml || true
 
+# Define pasta de trabalho
 WORKDIR /app
 
-# Copia os requisitos
+# 2. PyTorch CPU-only primeiro (evita baixar 2.5GB da versão CUDA)
 COPY requirements.txt .
-
-# 1º Passo (NOVO): Força a instalação do PyTorch apenas para CPU (economiza ~2.5GB de disco)
 RUN pip install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cpu
 
-# 2º Passo: Instala as dependências do projeto
+# 3. Restante das libs do Python
 RUN pip install --no-cache-dir -r requirements.txt \
     && pip cache purge
 
-# Copia código
+# 4. Copia o código
 COPY . .
 
-# Pastas de output
+# 5. Cria pastas de output
 RUN mkdir -p temp_uploads temp_outputs
 
-# Roda os dois processos: video API na porta 80 + scraper daemon
-# Usa um script de entrypoint para iniciar ambos
-# Inicia o uvicorn (porta 80) e aguarda 10s antes do scraper
-# para garantir que a API de vídeo já está pronta
+# 6. Inicia o servidor de vídeo (porta 80) + aguarda 10s + inicia o scraper daemon
 CMD uvicorn video:app --host 0.0.0.0 --port 80 & sleep 10 && python scraper.py
