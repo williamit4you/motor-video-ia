@@ -16,6 +16,7 @@ import pdfplumber
 import edge_tts
 import whisper
 
+
 # Imports do MoviePy (agora vai ler a variável acima com sucesso)
 from moviepy.editor import *
 from moviepy.video.tools.subtitles import SubtitlesClip
