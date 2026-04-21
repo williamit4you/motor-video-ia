@@ -1,0 +1,57 @@
+# ===== PYTHON =====
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.env
+.venv/
+venv/
+env/
+*.log
+
+# Arquivos temporários do pipeline
+temp_uploads/
+temp_outputs/
+temp_pexels_*
+temp_worker_*
+
+# ===== IGNORAR TUDO QUE FOR TYPESCRIPT / NEXT.JS =====
+*.ts
+*.tsx
+*.js
+*.jsx
+*.mjs
+*.mts
+*.cjs
+
+# Next.js
+.next/
+out/
+node_modules/
+
+# Configs de projeto TS
+tsconfig*.json
+next.config.*
+tailwind.config.*
+postcss.config.*
+package.json
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+.eslintrc*
+.prettierrc*
+jsconfig.json
+
+# Prisma (fica no projeto Next.js)
+prisma/
+
+# ===== SISTEMA =====
+.DS_Store
+Thumbs.db
+*.swp
+*.swo

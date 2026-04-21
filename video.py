@@ -139,48 +139,66 @@ def create_video_logic(audio_path, subtitles_data, output_file,
                 percentage = image_durations[i] if i < len(image_durations) else (100 / len(images))
                 duration = (percentage / 100) * total_duration
                 
-                # Image Processing - ROBUST METHOD
-                # 1. Open with PIL
-                # 2. Convert to RGB (Force 3 channels)
-                # 3. Save to a temporary JPG file
-                # 4. Load that JPG with MoviePy
+                # Detect if the file is a video or image
+                video_extensions = {'.mp4', '.mov', '.avi', '.mkv', '.webm'}
+                img_ext = os.path.splitext(img_path)[1].lower()
                 
-                processed_path = img_path + f"_proc_{i}.jpg"
-                
-                with PIL.Image.open(img_path) as im:
-                    im = im.convert("RGB") # Fixes the shape mismatch (grayscale vs rgb)
+                if img_ext in video_extensions:
+                    # --- VIDEO CLIP PATH ---
+                    raw_clip = VideoFileClip(img_path).without_audio()
                     
-                    # Optional: Resize large images to avoid memory issues, keeping aspect ratio
-                    # processing 4k images for 1080p output is wasteful
-                    # but let's just save for now to be safe
-                    im.save(processed_path, quality=95)
+                    # Loop or subclip to match target duration
+                    if raw_clip.duration < duration:
+                        raw_clip = raw_clip.loop(duration=duration)
+                    else:
+                        raw_clip = raw_clip.subclip(0, duration)
+                    
+                    # Resize to cover screen (cover/fill logic)
+                    cv_w, cv_h = raw_clip.size
+                    ratio_vid = cv_w / cv_h
+                    ratio_screen = W / H
+                    if ratio_vid > ratio_screen:
+                        raw_clip = raw_clip.resize(height=H)
+                    else:
+                        raw_clip = raw_clip.resize(width=W)
+                    
+                    img_clip = raw_clip
+                    
+                else:
+                    # --- IMAGE CLIP PATH (original logic) ---
+                    # Image Processing - ROBUST METHOD
+                    # 1. Open with PIL
+                    # 2. Convert to RGB (Force 3 channels)
+                    # 3. Save to a temporary JPG file
+                    # 4. Load that JPG with MoviePy
+                    
+                    processed_path = img_path + f"_proc_{i}.jpg"
+                    
+                    with PIL.Image.open(img_path) as im:
+                        im = im.convert("RGB") # Fixes the shape mismatch (grayscale vs rgb)
+                        im.save(processed_path, quality=95)
+                    
+                    # Create Clip from the PROCESSED file
+                    img_clip = ImageClip(processed_path).set_duration(duration)
+                    
+                    # RESIZE & CROP LOGIC (Cover/Fill)
+                    img_w, img_h = img_clip.size
+                    ratio_img = img_w / img_h
+                    ratio_screen = W / H
+                    
+                    if ratio_img > ratio_screen:
+                         img_clip = img_clip.resize(height=H)
+                    else: 
+                         img_clip = img_clip.resize(width=W)
                 
-                # Create Clip from the PROCESSED file
-                img_clip = ImageClip(processed_path).set_duration(duration)
-                
-                # RESIZE & CROP LOGIC (Cover/Fill)
-                # First, resize to cover the screen dimensions
-                # Calculate ratio
-                img_w, img_h = img_clip.size
-                ratio_img = img_w / img_h
-                ratio_screen = W / H
-                
-                # If image is wider (relative to screen), fit height and crop width
-                if ratio_img > ratio_screen:
-                     img_clip = img_clip.resize(height=H)
-                else: 
-                     img_clip = img_clip.resize(width=W)
-                     
-                # Apply Zoom
+                # Apply Zoom (applies to both video and image clips)
                 if img_conf["zoom"] != 1.0:
-                    # Apply static zoom
                     current_w, current_h = img_clip.size
                     img_clip = img_clip.resize(newsize=(current_w * img_conf["zoom"], current_h * img_conf["zoom"]))
 
                 # Center and Apply Pan
                 cw, ch = img_clip.size
                 
-                # Center coordinates based on Resize logic
                 x_center = (W - cw) / 2
                 y_center = (H - ch) / 2
                 
@@ -199,11 +217,12 @@ def create_video_logic(audio_path, subtitles_data, output_file,
                 
                 clips.append(combined)
             except Exception as e:
-                print(f"Error processing image {i}: {e}")
+                print(f"Error processing media {i}: {e}")
                 # Fallback to color to prevent pipeline crash
                 perc = image_durations[i] if i < len(image_durations) else (100/len(images))
                 dur = (perc / 100) * total_duration
-                clips.append(ColorClip(size=(W, H), color=bg_color, duration=dur))
+                rgb_bg = tuple(int(bg_color.lstrip('#')[j:j+2], 16) for j in (0, 2, 4))
+                clips.append(ColorClip(size=(W, H), color=rgb_bg, duration=dur))
 
         final_bg = concatenate_videoclips(clips).to_RGB()
         
