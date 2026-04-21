@@ -40,4 +40,6 @@ RUN mkdir -p temp_uploads temp_outputs
 
 # Roda os dois processos: video API na porta 80 + scraper daemon
 # Usa um script de entrypoint para iniciar ambos
-CMD uvicorn video:app --host 0.0.0.0 --port 80 & python scraper.py & wait
+# Inicia o uvicorn (porta 80) e aguarda 10s antes do scraper
+# para garantir que a API de vídeo já está pronta
+CMD uvicorn video:app --host 0.0.0.0 --port 80 & sleep 10 && python scraper.py
