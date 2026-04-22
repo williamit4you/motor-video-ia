@@ -84,6 +84,10 @@ DEFAULT_CONFIG = {
     "ttsVoice": "pt-BR-AntonioNeural",
     "ttsSpeed": "+5%",
     "pexelsEnabled": True,
+    "autoPublishReels": False,
+    "autoPublishStory": False,
+    "autoPublishTikTok": False,
+    "autoPublishLinkedIn": False,
 }
 
 # ─── INIT S3 ──────────────────────────────────────────────────────────────────
@@ -785,8 +789,12 @@ def push_to_nextjs(article_data: dict, source_url: str, video_url: str | None):
         log_pipeline("INGEST", f"📡 Next.js respondeu HTTP {res.status_code}")
 
         if res.status_code == 200:
+            resp_data = res.json()
             log_pipeline("INGEST", f"✅ Notícia salva com sucesso: '{title[:60]}'", "SUCCESS")
-            return True, res.json().get("id")  # retorna também o ID do post
+            return True, {
+                "postId": resp_data.get("post"),
+                "socialPostId": resp_data.get("socialPostId"),
+            }
         elif res.status_code == 409:
             log_pipeline("INGEST", f"⚠️ Notícia duplicada (já existe): {source_url[:60]}", "WARN")
         else:
@@ -798,6 +806,53 @@ def push_to_nextjs(article_data: dict, source_url: str, video_url: str | None):
         log_pipeline("INGEST", f"❌ Falha de conexão com Next.js: {e}", "ERROR")
 
     return False, None
+
+
+# ─── AUTO-PUBLICAÇÃO NAS PLATAFORMAS ────────────────────────────────────────────────
+
+def auto_publish(social_post_id: str, endpoint: str) -> bool:
+    """É chamado após criação do vídeo para publicar automaticamente numa plataforma."""
+    try:
+        url = f"{NEXT_JS_BASE_URL}{endpoint}"
+        res = requests.post(
+            url,
+            json={"socialPostId": social_post_id},
+            headers={"x-worker-secret": SECRET_CRON_KEY},
+            timeout=60
+        )
+        if res.ok:
+            log_pipeline("AUTO-PUBLISH", f"\u2705 {endpoint} → OK (socialPostId={social_post_id})", "SUCCESS")
+            return True
+        else:
+            log_pipeline("AUTO-PUBLISH", f"\u274c {endpoint} → HTTP {res.status_code}: {res.text[:120]}", "ERROR")
+            return False
+    except Exception as e:
+        log_pipeline("AUTO-PUBLISH", f"\u274c {endpoint} → Erro: {e}", "ERROR")
+        return False
+
+
+def auto_publish_to_platforms(social_post_id: str | None, config: dict):
+    """Publica automaticamente nas plataformas configuradas via flags no ScraperConfig."""
+    if not social_post_id:
+        log_pipeline("AUTO-PUBLISH", "⚠️ Sem social_post_id — pulando auto-publicação", "WARN")
+        return
+
+    if config.get("autoPublishReels"):
+        log_pipeline("AUTO-PUBLISH", "📹 Auto-publicando como Reels (Meta)...")
+        auto_publish(social_post_id, "/api/social/publish")
+
+    if config.get("autoPublishStory"):
+        log_pipeline("AUTO-PUBLISH", "📸 Auto-publicando como Story 24h (Meta)...")
+        auto_publish(social_post_id, "/api/social/publish-story")
+
+    if config.get("autoPublishTikTok"):
+        log_pipeline("AUTO-PUBLISH", "🎵 Auto-publicando no TikTok...")
+        auto_publish(social_post_id, "/api/social/publish-tiktok")
+
+    if config.get("autoPublishLinkedIn"):
+        log_pipeline("AUTO-PUBLISH", "💼 Auto-publicando no LinkedIn...")
+        auto_publish(social_post_id, "/api/social/publish-linkedin")
+
 
 # ─── PIPELINE PRINCIPAL ───────────────────────────────────────────────────────
 
@@ -864,9 +919,15 @@ def run_pipeline(sources: list, config: dict, trigger_type: str = "AUTO"):
                 log_pipeline("VIDEO", "   ⚠️ Sem roteiro (summary) — vídeo não será gerado", "WARN")
 
             # 4. Salva no banco
-            saved, post_id = push_to_nextjs(ai_output, link, video_url)
+            saved, saved_ids = push_to_nextjs(ai_output, link, video_url)
             if saved:
                 articles_saved += 1
+                # saved_ids pode ser post_id ou dict com post_id e social_post_id
+                social_post_id = None
+                if isinstance(saved_ids, dict):
+                    social_post_id = saved_ids.get("socialPostId")
+                # 5. Auto-publicar nas plataformas configuradas
+                auto_publish_to_platforms(social_post_id, config)
 
     run_status = "SUCCESS" if articles_saved > 0 else ("FAILED" if articles_found == 0 else "PARTIAL")
     log_pipeline("INGEST", f"🏁 Pipeline finalizado! {articles_saved}/{articles_found} artigo(s) salvos | "
