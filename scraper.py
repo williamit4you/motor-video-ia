@@ -62,11 +62,14 @@ Você deve outputar um JSON rigorosamente estruturado com:
 
 # ─── INSTRUÇÕES DE ESTILO ─────────────────────────────────────────────────────
 STYLE_INSTRUCTIONS = {
-    "journalism": "Escreva de forma jornalística: informativo, direto, objetivo.",
-    "story":      "Escreva como uma história: narrativo, envolvente, com início, meio e fim.",
-    "ad":         "Escreva como propaganda: persuasivo, apelativo, focado em benefícios.",
-    "funny":      "Escreva de forma divertida: com humor, descontraído, mas informativo.",
-    "ironic":     "Escreva de forma irônica: crítico, sarcástico, mas embasado nos fatos.",
+    "journalism":    "Escreva de forma jornalística: informativo, direto, objetivo.",
+    "story":         "Escreva como uma história: narrativo, envolvente, com início, meio e fim.",
+    "ad":            "Escreva como propaganda: persuasivo, apelativo, focado em benefícios.",
+    "funny":         "Escreva de forma divertida: com humor, descontraído, mas informativo.",
+    "ironic":        "Escreva de forma irônica: crítico, sarcástico, mas embasado nos fatos.",
+    "polemico":      "Escreva de forma POLÊMICA e viral: provocador, com gatilhos emocionais (indignação, surpresa, curiosidade). Gancho forte nos primeiros 3 segundos. Foco máximo em compartilhamento.",
+    "breaking":      "Escreva como breaking news AO VIVO: urgência máxima, boletim direto, sensação de última hora. Use linguagem de telejornal em estado de alerta.",
+    "investigativo": "Escreva de forma investigativa: revele o que está por trás da notícia, questione, aprofunde. Tom de suspense jornalístico. Mostre contextos ocultos e impactos não óbvios.",
 }
 
 # ─── CONFIG PADRÃO DE FALLBACK ────────────────────────────────────────────────
