@@ -7,6 +7,7 @@ from bs4 import BeautifulSoup
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
+from langchain_community.callbacks.manager import get_openai_callback
 from datetime import datetime, timedelta
 from urllib.parse import urljoin
 import boto3
@@ -25,6 +26,9 @@ NEXT_JS_BASE_URL   = os.environ.get("NEXT_JS_BASE_URL", "http://localhost:3000")
 NEXT_JS_INGEST_URL = os.environ.get("NEXT_JS_INGEST_URL",  f"{NEXT_JS_BASE_URL}/api/worker/ingest")
 NEXT_JS_SOURCES_URL= os.environ.get("NEXT_JS_SOURCES_URL", f"{NEXT_JS_BASE_URL}/api/worker/sources")
 NEXT_JS_LOG_URL    = os.environ.get("NEXT_JS_LOG_URL",    f"{NEXT_JS_BASE_URL}/api/pipeline/log")
+NEXT_JS_CONFIG_URL = f"{NEXT_JS_BASE_URL}/api/worker/config"
+NEXT_JS_RUNS_URL   = f"{NEXT_JS_BASE_URL}/api/worker/runs"
+NEXT_JS_AI_USAGE_URL = f"{NEXT_JS_BASE_URL}/api/worker/ai-usage"
 SECRET_CRON_KEY    = os.environ.get("WORKER_SECRET_KEY", "super-secret-worker-key-123")
 FASTAPI_URL        = os.environ.get("FASTAPI_URL", "http://localhost:8000/gerar-video")
 PEXELS_API_KEY     = os.environ.get("PEXELS_API_KEY", "")
@@ -36,7 +40,51 @@ MINIO_SECRET_KEY = os.environ.get("MINIO_SECRET_KEY")
 MINIO_BUCKET_NAME= os.environ.get("MINIO_BUCKET_NAME", "uploads")
 MINIO_PUBLIC_URL = os.environ.get("MINIO_PUBLIC_URL")
 
-INTERVAL_HOURS = 6
+# ─── PREÇOS OPENAI (USD por 1M tokens) ───────────────────────────────────────
+# Fonte: https://openai.com/pricing — atualizar conforme necessário
+OPENAI_PRICING = {
+    "gpt-4o":        {"input": 2.50,  "output": 10.00},
+    "gpt-4o-mini":   {"input": 0.15,  "output": 0.60},
+    "gpt-4-turbo":   {"input": 10.00, "output": 30.00},
+    "gpt-4":         {"input": 30.00, "output": 60.00},
+    "gpt-3.5-turbo": {"input": 0.50,  "output": 1.50},
+}
+
+# ─── PROMPT PADRÃO (fallback se o banco não tiver config) ────────────────────
+DEFAULT_SYSTEM_PROMPT = """Você é um jornalista independente de tecnologia focado em alta conversão SEO.
+Seu objetivo é ler um texto raw raspado da internet, e REESCREVÊ-LO por completo com suas palavras,
+garantindo que NENHUM plágio seja detectado, mas mantendo 100% da precisão dos fatos noticiados.
+Você deve outputar um JSON rigorosamente estruturado com:
+- "title": Um título impactante (SEM clickbait exagerado, formato editorial)
+- "summary": Um roteiro ENGAJADOR e direto de até {duration_sec} segundos de locução para um vídeo TikTok/Reels/Story baseado na notícia (máx 450 caracteres).
+- "content_html": O artigo escrito, formatado com tags HTML semânticas como <p>, <h2>, e <b>. Formato pronto pro TipTap Editor.
+{style_instruction}"""
+
+# ─── INSTRUÇÕES DE ESTILO ─────────────────────────────────────────────────────
+STYLE_INSTRUCTIONS = {
+    "journalism": "Escreva de forma jornalística: informativo, direto, objetivo.",
+    "story":      "Escreva como uma história: narrativo, envolvente, com início, meio e fim.",
+    "ad":         "Escreva como propaganda: persuasivo, apelativo, focado em benefícios.",
+    "funny":      "Escreva de forma divertida: com humor, descontraído, mas informativo.",
+    "ironic":     "Escreva de forma irônica: crítico, sarcástico, mas embasado nos fatos.",
+}
+
+# ─── CONFIG PADRÃO DE FALLBACK ────────────────────────────────────────────────
+DEFAULT_CONFIG = {
+    "intervalHours": 6,
+    "scheduledTimes": "[]",
+    "useScheduledTimes": False,
+    "isEnabled": True,
+    "maxArticlesPerRun": 3,
+    "aiModel": "gpt-4o-mini",
+    "aiTemperature": 0.7,
+    "systemPrompt": DEFAULT_SYSTEM_PROMPT,
+    "videoDurationSec": 30,
+    "videoStyle": "journalism",
+    "ttsVoice": "pt-BR-AntonioNeural",
+    "ttsSpeed": "+5%",
+    "pexelsEnabled": True,
+}
 
 # ─── INIT S3 ──────────────────────────────────────────────────────────────────
 try:
@@ -132,6 +180,27 @@ def test_connectivity():
 
 # ─── CONFIG DINÂMICA DO ADMIN ─────────────────────────────────────────────────
 
+def get_scraper_config() -> dict:
+    """Busca configurações dinâmicas do painel admin. Usa fallback seguro se falhar."""
+    try:
+        res = requests.get(
+            NEXT_JS_CONFIG_URL,
+            headers={"x-worker-secret": SECRET_CRON_KEY},
+            timeout=5
+        )
+        if res.status_code == 200:
+            cfg = res.json()
+            log_pipeline("CONFIG", f"✅ Config carregada: model={cfg.get('aiModel')}, "
+                         f"maxArticles={cfg.get('maxArticlesPerRun')}, "
+                         f"isEnabled={cfg.get('isEnabled')}, "
+                         f"style={cfg.get('videoStyle')}", "INFO")
+            return cfg
+        else:
+            log_pipeline("CONFIG", f"⚠️ HTTP {res.status_code} ao buscar config — usando padrão", "WARN")
+    except Exception as e:
+        log_pipeline("CONFIG", f"⚠️ Falha ao buscar config ({e}) — usando padrão", "WARN")
+    return DEFAULT_CONFIG.copy()
+
 def get_dynamic_config():
     """Lê do Next.js quais scrapers estão ativos e se o botão manual foi acionado."""
     try:
@@ -144,6 +213,100 @@ def get_dynamic_config():
     except Exception as e:
         log_pipeline("ERROR", f"❌ Sem comunicação com Next.js: {e}", "ERROR")
     return {"sources": [], "trigger_now": False}
+
+# ─── GERENCIAMENTO DE EXECUÇÕES ───────────────────────────────────────────────
+
+def create_run_record(trigger_type: str = "AUTO") -> str | None:
+    """Cria um registro de execução no banco e retorna o ID."""
+    try:
+        res = requests.post(
+            NEXT_JS_RUNS_URL,
+            json={"triggerType": trigger_type, "startedAt": datetime.now().isoformat()},
+            headers={"x-worker-secret": SECRET_CRON_KEY},
+            timeout=5
+        )
+        if res.status_code == 200:
+            run_id = res.json().get("id")
+            log_pipeline("RUN", f"📋 Execução registrada: ID={run_id}")
+            return run_id
+    except Exception as e:
+        log_pipeline("RUN", f"⚠️ Falha ao registrar execução: {e}", "WARN")
+    return None
+
+def finish_run_record(run_id: str | None, status: str, found: int, saved: int,
+                      tokens_in: int = 0, tokens_out: int = 0, cost_usd: float = 0.0,
+                      error: str | None = None):
+    """Fecha o registro de execução com os resultados finais."""
+    if not run_id:
+        return
+    try:
+        requests.patch(
+            f"{NEXT_JS_RUNS_URL}/{run_id}",
+            json={
+                "status": status,
+                "articlesFound": found,
+                "articlesSaved": saved,
+                "finishedAt": datetime.now().isoformat(),
+                "totalTokensIn": tokens_in,
+                "totalTokensOut": tokens_out,
+                "totalCostUsd": cost_usd,
+                "errorMessage": error,
+            },
+            headers={"x-worker-secret": SECRET_CRON_KEY},
+            timeout=5
+        )
+    except Exception as e:
+        log_pipeline("RUN", f"⚠️ Falha ao fechar registro de execução: {e}", "WARN")
+
+# ─── RASTREAMENTO DE CUSTOS DE IA ─────────────────────────────────────────────
+
+def calculate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
+    """Calcula o custo em USD baseado no modelo e tokens usados."""
+    prices = OPENAI_PRICING.get(model, {"input": 0.0, "output": 0.0})
+    cost = (prompt_tokens / 1_000_000) * prices["input"]
+    cost += (completion_tokens / 1_000_000) * prices["output"]
+    return round(cost, 8)
+
+def log_ai_usage(run_id: str | None, post_id: str | None, operation: str,
+                 model: str, prompt_tokens: int, completion_tokens: int,
+                 cost_usd: float, input_summary: str = "", output_summary: str = ""):
+    """Envia o registro de uso de IA para o Next.js."""
+    try:
+        requests.post(
+            NEXT_JS_AI_USAGE_URL,
+            json={
+                "runId": run_id,
+                "postId": post_id,
+                "operation": operation,
+                "model": model,
+                "promptTokens": prompt_tokens,
+                "completionTokens": completion_tokens,
+                "totalTokens": prompt_tokens + completion_tokens,
+                "costUsd": cost_usd,
+                "inputSummary": input_summary[:200] if input_summary else "",
+                "outputSummary": output_summary[:200] if output_summary else "",
+            },
+            headers={"x-worker-secret": SECRET_CRON_KEY},
+            timeout=5
+        )
+    except Exception as e:
+        log_pipeline("AI_COST", f"⚠️ Falha ao registrar uso IA: {e}", "WARN")
+
+# ─── AGENDAMENTO ──────────────────────────────────────────────────────────────
+
+def should_run_now(config: dict, next_auto_run_time: datetime) -> bool:
+    """Verifica se deve executar agora baseado na config de agendamento."""
+    use_scheduled = config.get("useScheduledTimes", False)
+    try:
+        scheduled_times = json.loads(config.get("scheduledTimes", "[]"))
+    except Exception:
+        scheduled_times = []
+
+    if use_scheduled and scheduled_times:
+        current_hhmm = datetime.now().strftime("%H:%M")
+        return current_hhmm in scheduled_times
+    else:
+        return datetime.now() >= next_auto_run_time
 
 # ─── SCRAPING ─────────────────────────────────────────────────────────────────
 
@@ -191,7 +354,7 @@ def fetch_rss(url: str) -> list:
     except Exception:
         return []
 
-def fetch_and_parse(url: str) -> list:
+def fetch_and_parse(url: str, max_articles: int = 3) -> list:
     """Acessa a página-fonte e extrai links de artigos reais."""
     log_pipeline("FETCH", f"🌐 Acessando fonte: {url}")
     
@@ -199,7 +362,7 @@ def fetch_and_parse(url: str) -> list:
     rss_links = fetch_rss(url)
     if rss_links:
         log_pipeline("FETCH", f"📡 RSS detectado! {len(rss_links)} artigo(s) encontrados")
-        return rss_links[:3]
+        return rss_links[:max_articles]
     
     # Fallback: scraping HTML
     headers = {
@@ -243,7 +406,7 @@ def fetch_and_parse(url: str) -> list:
                 continue
             links.append(href)
 
-        unique = list(dict.fromkeys(links))[:3]  # preserva ordem, remove duplas
+        unique = list(dict.fromkeys(links))[:max_articles]  # preserva ordem, remove duplas
         log_pipeline("FETCH", f"✅ {len(unique)} artigo(s) válido(s) selecionados")
         return unique
 
@@ -303,32 +466,58 @@ def read_article_text(article_url: str) -> str:
 
 # ─── IA ───────────────────────────────────────────────────────────────────────
 
-def rewrite_with_ai(raw_text: str):
-    """Usa GPT-4o-mini para reescrever o artigo e gerar o roteiro."""
-    log_pipeline("AI", f"🤖 Enviando {len(raw_text[:8000])} chars para GPT-4o-mini...")
+def rewrite_with_ai(raw_text: str, config: dict, run_id: str | None = None):
+    """Usa a IA configurada para reescrever o artigo e gerar o roteiro."""
+    model_name = config.get("aiModel", "gpt-4o-mini")
+    temperature = config.get("aiTemperature", 0.7)
+    video_style = config.get("videoStyle", "journalism")
+    duration_sec = config.get("videoDurationSec", 30)
+    
+    # Monta o prompt com estilo e duração dinâmicos
+    base_prompt = config.get("systemPrompt") or DEFAULT_SYSTEM_PROMPT
+    style_instruction = STYLE_INSTRUCTIONS.get(video_style, STYLE_INSTRUCTIONS["journalism"])
+    system_prompt = base_prompt.replace("{duration_sec}", str(duration_sec)).replace("{style_instruction}", style_instruction)
+    
+    log_pipeline("AI", f"🤖 Modelo: {model_name} | Estilo: {video_style} | Duração alvo: {duration_sec}s")
+    log_pipeline("AI", f"🤖 Enviando {len(raw_text[:8000])} chars para {model_name}...")
 
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.7)
+    llm = ChatOpenAI(model=model_name, temperature=temperature)
 
     prompt = ChatPromptTemplate.from_messages([
-        ("system", """Você é um jornalista independente de tecnologia focado em alta conversão SEO.
-Seu objetivo é ler um texto raw raspado da internet, e REESCREVÊ-LO por completo com suas palavras,
-garantindo que NENHUM plágio seja detectado, mas mantendo 100% da precisão dos fatos noticiados.
-Você deve outputar um JSON rigorosamente estruturado com:
-- "title": Um título impactante (SEM clickbait exagerado, formato editorial)
-- "summary": Um roteiro ENGAJADOR e direto de até 30 segundos de locução para um vídeo TikTok/Reels/Story baseado na notícia (máx 450 caracteres).
-- "content_html": O artigo escrito, formatado com tags HTML semânticas como <p>, <h2>, e <b>. Formato pronto pro TipTap Editor.
-"""),
+        ("system", system_prompt),
         ("user", "Texto Original Bruto: {raw_text}")
     ])
 
     chain = prompt | llm | JsonOutputParser()
     try:
         log_pipeline("AI", "⏳ Aguardando resposta da OpenAI...")
-        resultado = chain.invoke({"raw_text": raw_text[:8000]})
+        
+        with get_openai_callback() as cb:
+            resultado = chain.invoke({"raw_text": raw_text[:8000]})
+            
+            # Captura tokens e calcula custo
+            prompt_tokens = cb.prompt_tokens
+            completion_tokens = cb.completion_tokens
+            cost = calculate_cost(model_name, prompt_tokens, completion_tokens)
+            
+            log_pipeline("AI", f"💰 Tokens: {prompt_tokens}in + {completion_tokens}out = {cb.total_tokens} total | Custo: US$ {cost:.6f}", "SUCCESS")
+            
+            # Registra no banco
+            log_ai_usage(
+                run_id=run_id,
+                post_id=None,
+                operation="rewrite_article",
+                model=model_name,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                cost_usd=cost,
+                input_summary=raw_text[:200],
+                output_summary=str(resultado.get("title", "") if resultado else "")[:200],
+            )
 
         if not resultado:
             log_pipeline("AI", "❌ IA retornou resultado vazio", "ERROR")
-            return None
+            return None, 0, 0, 0.0
 
         title = resultado.get('title', 'sem título')
         summary = resultado.get('summary', '')
@@ -338,12 +527,12 @@ Você deve outputar um JSON rigorosamente estruturado com:
         log_pipeline("AI", f"📝 Resumo (roteiro): {summary[:80]}...")
         log_pipeline("AI", f"📄 Artigo HTML: {len(content)} chars gerados")
 
-        return resultado
+        return resultado, prompt_tokens, completion_tokens, cost
 
     except Exception as e:
         log_pipeline("AI", f"❌ Erro na chamada OpenAI: {e}", "ERROR")
         log_pipeline("AI", f"   Traceback: {traceback.format_exc()[-300:]}", "ERROR")
-        return None
+        return None, 0, 0, 0.0
 
 # ─── MINIO UPLOAD ─────────────────────────────────────────────────────────────
 
@@ -462,15 +651,25 @@ def fetch_pexels_media(query: str) -> list:
 
 # ─── GERAÇÃO DE VÍDEO ─────────────────────────────────────────────────────────
 
-def generate_video_and_upload(summary_text: str, keywords: str = "") -> str | None:
+def generate_video_and_upload(summary_text: str, keywords: str = "", config: dict = None) -> str | None:
+    if config is None:
+        config = DEFAULT_CONFIG.copy()
+    
+    tts_speed = config.get("ttsSpeed", "+5%")
+    tts_voice = config.get("ttsVoice", "pt-BR-AntonioNeural")
+    pexels_enabled = config.get("pexelsEnabled", True)
+    
     log_pipeline("VIDEO", f"🎬 Iniciando geração de vídeo portrait...")
     log_pipeline("VIDEO", f"📝 Roteiro ({len(summary_text)} chars): {summary_text[:80]}...")
+    log_pipeline("VIDEO", f"🎙️ Voz: {tts_voice} | Velocidade: {tts_speed} | Pexels: {'✅' if pexels_enabled else '❌'}")
 
-    # Busca fundo Pexels
+    # Busca fundo Pexels (se habilitado na config)
     pexels_paths = []
-    if keywords:
+    if keywords and pexels_enabled:
         log_pipeline("VIDEO", f"🔑 Keywords para Pexels: '{keywords}'")
         pexels_paths = fetch_pexels_media(keywords)
+    elif not pexels_enabled:
+        log_pipeline("VIDEO", "⚠️ Pexels desabilitado na config — usando fundo sólido", "WARN")
     else:
         log_pipeline("VIDEO", "⚠️ Sem keywords — usando fundo preto", "WARN")
 
@@ -479,7 +678,8 @@ def generate_video_and_upload(summary_text: str, keywords: str = "") -> str | No
             "text": summary_text,
             "video_format": "portrait",
             "background_color": "#111827",
-            "speed": "+5%"
+            "speed": tts_speed,
+            "voice": tts_voice,
         }
 
         multipart_files = [("dummy", ("", ""))]
@@ -548,7 +748,6 @@ def generate_video_and_upload(summary_text: str, keywords: str = "") -> str | No
 
     except requests.Timeout:
         log_pipeline("VIDEO", f"❌ Timeout (600s) — FastAPI demorou mais de 10min para gerar o vídeo", "ERROR")
-        # Limpa temporários em caso de falha
         for fh in open_handles:
             try: fh.close()
             except: pass
@@ -587,7 +786,7 @@ def push_to_nextjs(article_data: dict, source_url: str, video_url: str | None):
 
         if res.status_code == 200:
             log_pipeline("INGEST", f"✅ Notícia salva com sucesso: '{title[:60]}'", "SUCCESS")
-            return True
+            return True, res.json().get("id")  # retorna também o ID do post
         elif res.status_code == 409:
             log_pipeline("INGEST", f"⚠️ Notícia duplicada (já existe): {source_url[:60]}", "WARN")
         else:
@@ -598,16 +797,23 @@ def push_to_nextjs(article_data: dict, source_url: str, video_url: str | None):
     except Exception as e:
         log_pipeline("INGEST", f"❌ Falha de conexão com Next.js: {e}", "ERROR")
 
-    return False
+    return False, None
 
 # ─── PIPELINE PRINCIPAL ───────────────────────────────────────────────────────
 
-def run_pipeline(sources: list):
+def run_pipeline(sources: list, config: dict, trigger_type: str = "AUTO"):
     total = len(sources)
-    log_pipeline("FETCH", f"🚀 Pipeline iniciado — {total} fonte(s) para processar")
+    max_articles = config.get("maxArticlesPerRun", 3)
+    log_pipeline("FETCH", f"🚀 Pipeline iniciado — {total} fonte(s) | máx {max_articles} artigos por fonte")
 
+    # Registra a execução no banco
+    run_id = create_run_record(trigger_type)
+    
     articles_found = 0
     articles_saved = 0
+    total_tokens_in = 0
+    total_tokens_out = 0
+    total_cost = 0.0
 
     for idx, source in enumerate(sources, 1):
         url = source.get('url')
@@ -618,7 +824,7 @@ def run_pipeline(sources: list):
             continue
 
         log_pipeline("FETCH", f"━━━ Fonte {idx}/{total}: {name} ━━━")
-        links = fetch_and_parse(url)
+        links = fetch_and_parse(url, max_articles)
 
         if not links:
             log_pipeline("FETCH", f"⚠️ Nenhum link encontrado em '{name}'", "WARN")
@@ -634,8 +840,12 @@ def run_pipeline(sources: list):
                 log_pipeline("FETCH", f"   ⚠️ Conteúdo insuficiente ({len(raw_text)} chars) — pulando", "WARN")
                 continue
 
-            # 2. IA reescreve
-            ai_output = rewrite_with_ai(raw_text)
+            # 2. IA reescreve (retorna tokens e custo)
+            ai_output, tokens_in, tokens_out, cost = rewrite_with_ai(raw_text, config, run_id)
+            total_tokens_in += tokens_in
+            total_tokens_out += tokens_out
+            total_cost += cost
+            
             if not ai_output:
                 log_pipeline("AI", "   ❌ IA não retornou resultado — pulando artigo", "ERROR")
                 continue
@@ -649,16 +859,22 @@ def run_pipeline(sources: list):
             if summary_script:
                 keywords = " ".join([w for w in title.split() if len(w) > 4][:4])
                 log_pipeline("VIDEO", f"   🎬 Gerando vídeo com keywords: '{keywords}'")
-                video_url = generate_video_and_upload(summary_script, keywords)
+                video_url = generate_video_and_upload(summary_script, keywords, config)
             else:
                 log_pipeline("VIDEO", "   ⚠️ Sem roteiro (summary) — vídeo não será gerado", "WARN")
 
             # 4. Salva no banco
-            saved = push_to_nextjs(ai_output, link, video_url)
+            saved, post_id = push_to_nextjs(ai_output, link, video_url)
             if saved:
                 articles_saved += 1
 
-    log_pipeline("INGEST", f"🏁 Pipeline finalizado! {articles_saved}/{articles_found} artigo(s) salvos com sucesso", "SUCCESS")
+    run_status = "SUCCESS" if articles_saved > 0 else ("FAILED" if articles_found == 0 else "PARTIAL")
+    log_pipeline("INGEST", f"🏁 Pipeline finalizado! {articles_saved}/{articles_found} artigo(s) salvos | "
+                 f"💰 Custo total: US$ {total_cost:.6f} | Tokens: {total_tokens_in + total_tokens_out}", "SUCCESS")
+    
+    # Fecha registro de execução
+    finish_run_record(run_id, run_status, articles_found, articles_saved,
+                      total_tokens_in, total_tokens_out, total_cost)
 
 # ─── DAEMON PRINCIPAL ─────────────────────────────────────────────────────────
 
@@ -670,31 +886,64 @@ if __name__ == "__main__":
 
     print_env_diagnostics()
 
-    next_auto_run_time = datetime.now()
+    # Carrega config inicial
+    scraper_config = get_scraper_config()
+    interval_hours = scraper_config.get("intervalHours", 6)
+
+    # Primeira execução automática só após INTERVAL_HOURS
+    # (evita rodar imediatamente ao reiniciar o container)
+    next_auto_run_time = datetime.now() + timedelta(hours=interval_hours)
+
     first_run = True
+    last_scheduled_minute = ""  # Controla que horários fixos não disparem mais de uma vez no mesmo minuto
 
     while True:
         try:
-            config = get_dynamic_config()
-            sources = config.get("sources", [])
-            trigger_now = config.get("trigger_now", False)
+            # Atualiza config a cada ciclo (permite mudanças sem reiniciar)
+            scraper_config = get_scraper_config()
+            sources_data = get_dynamic_config()
+            sources = sources_data.get("sources", [])
+            trigger_now = sources_data.get("trigger_now", False)
+
+            # Atualiza intervalo se mudou na config
+            interval_hours = scraper_config.get("intervalHours", 6)
 
             # Roda teste de conectividade na primeira iteração
             if first_run:
                 test_connectivity()
                 first_run = False
 
+            # Verifica se coleta automática está habilitada
+            is_enabled = scraper_config.get("isEnabled", True)
+            if not is_enabled and not trigger_now:
+                next_run_str = next_auto_run_time.strftime('%d/%m %H:%M')
+                log_pipeline("DAEMON", f"⏸️ Coleta automática DESABILITADA pelo admin. Aguardando reativação...")
+                time.sleep(60)
+                continue
+
+            current_minute = datetime.now().strftime("%H:%M")
+
             if trigger_now:
                 log_pipeline("FETCH", f"⚡ DISPARO MANUAL DETECTADO! {len(sources)} fonte(s) configurada(s)", "INFO")
-                run_pipeline(sources)
-                next_auto_run_time = datetime.now() + timedelta(hours=INTERVAL_HOURS)
+                run_pipeline(sources, scraper_config, "MANUAL")
+                next_auto_run_time = datetime.now() + timedelta(hours=interval_hours)
                 log_pipeline("FETCH", f"⏰ Próxima execução automática: {next_auto_run_time.strftime('%d/%m %H:%M')}")
 
-            elif datetime.now() >= next_auto_run_time:
-                log_pipeline("FETCH", f"🕒 Execução automática periódica — {len(sources)} fonte(s)", "INFO")
-                run_pipeline(sources)
-                next_auto_run_time = datetime.now() + timedelta(hours=INTERVAL_HOURS)
-                log_pipeline("FETCH", f"⏰ Próxima execução automática: {next_auto_run_time.strftime('%d/%m %H:%M')}")
+            elif should_run_now(scraper_config, next_auto_run_time) and current_minute != last_scheduled_minute:
+                use_scheduled = scraper_config.get("useScheduledTimes", False)
+                mode_label = "por horário fixo" if use_scheduled else "periódica"
+                log_pipeline("FETCH", f"🕒 Execução automática {mode_label} — {len(sources)} fonte(s)", "INFO")
+                run_pipeline(sources, scraper_config, "AUTO")
+                last_scheduled_minute = current_minute
+                if not use_scheduled:
+                    next_auto_run_time = datetime.now() + timedelta(hours=interval_hours)
+                    log_pipeline("FETCH", f"⏰ Próxima execução automática: {next_auto_run_time.strftime('%d/%m %H:%M')}")
+            else:
+                # Log apenas uma vez por hora para não poluir
+                if datetime.now().minute == 0:
+                    remaining = next_auto_run_time - datetime.now()
+                    mins = int(remaining.total_seconds() / 60)
+                    log_pipeline("DAEMON", f"😴 Aguardando... próx. coleta em {mins} min")
 
         except Exception as general_error:
             log_pipeline("ERROR", f"💥 ERRO CRÍTICO NO DAEMON: {general_error}", "ERROR")
