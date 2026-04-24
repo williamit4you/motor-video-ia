@@ -38,7 +38,7 @@ def patch_question(qid: str, data: dict):
   return res.json()
 
 
-def create_project(question_text: str, cfg: dict):
+def create_project(question_text: str, cfg: dict, use_external_media: bool):
   url = f"{NEXT_BASE_URL}/api/video-code/projects"
   payload = {
     "ideaPrompt": question_text,
@@ -46,6 +46,7 @@ def create_project(question_text: str, cfg: dict):
     "videoDurationSec": cfg.get("videoDurationSec", 30),
     "ttsVoice": cfg.get("ttsVoice", "pt-BR-AntonioNeural"),
     "ttsSpeed": cfg.get("ttsSpeed", "+5%"),
+    "useExternalMedia": use_external_media,
   }
   res = requests.post(url, headers={"Content-Type": "application/json"}, data=json.dumps(payload), timeout=30)
   res.raise_for_status()
@@ -88,10 +89,13 @@ def process_one(cfg: dict):
 
   qid = q["id"]
   text = q["questionText"]
-  log(f"🧠 Processando pergunta {qid}: {text[:70]}...")
+  # Use flag from question if true, else fallback to global config
+  use_external_media = q.get("useExternalMedia", False) or cfg.get("useExternalMedia", False)
+  
+  log(f"🧠 Processando pergunta {qid}: {text[:70]}... (ExternalMedia: {use_external_media})")
 
   try:
-    project = create_project(text, cfg)
+    project = create_project(text, cfg, use_external_media)
     patch_question(qid, {"codeVideoProjectId": project["id"]})
 
     log("🤖 Gerando roteiro/cenas...")
