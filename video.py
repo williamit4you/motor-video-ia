@@ -301,6 +301,23 @@ async def simular_audio(
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
+@app.post("/gerar-audio")
+async def gerar_audio_endpoint(
+    text: str = Form(...),
+    voice: str = Form("pt-BR-AntonioNeural"),
+    speed: str = Form("+0%")
+):
+    if not text or len(text.strip()) == 0:
+        raise HTTPException(status_code=400, detail="Forneça o campo text.")
+
+    try:
+        base_name = f"audio_{os.urandom(4).hex()}"
+        audio_path = os.path.join(OUTPUT_DIR, f"{base_name}.mp3")
+        await generate_audio(text, audio_path, voice, speed)
+        return FileResponse(audio_path, media_type="audio/mpeg", filename=f"{base_name}.mp3")
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
 @app.post("/gerar-video")
 async def gerar_video_endpoint(
     file: Optional[UploadFile] = File(None),
