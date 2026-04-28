@@ -113,7 +113,8 @@ def process_one(cfg: dict):
       enqueue_social(qid, "TIKTOK")
     if cfg.get("autoEnqueueLinkedIn"):
       enqueue_social(qid, "LINKEDIN")
-    # YouTube: não implementado
+    if cfg.get("autoEnqueueYouTube"):
+      enqueue_social(qid, "YOUTUBE")
 
     return True
   except Exception as e:
