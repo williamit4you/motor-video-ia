@@ -56,7 +56,7 @@ Seu objetivo é ler um texto raw raspado da internet, e REESCREVÊ-LO por comple
 garantindo que NENHUM plágio seja detectado, mas mantendo 100% da precisão dos fatos noticiados.
 Você deve outputar um JSON rigorosamente estruturado com:
 - "title": Um título impactante (SEM clickbait exagerado, formato editorial)
-- "summary": Um roteiro ENGAJADOR e direto de até {duration_sec} segundos de locução para um vídeo TikTok/Reels/Story baseado na notícia (máx 450 caracteres).
+- "summary": Um roteiro ENGAJADOR e direto para um vídeo TikTok/Reels/Story baseado na notícia, com tamanho proporcional a {duration_sec} segundos de locução. Mire em cerca de {summary_char_target} a {summary_char_max} caracteres.
 - "content_html": O artigo escrito, formatado com tags HTML semânticas como <p>, <h2>, e <b>. Formato pronto pro TipTap Editor.
 {style_instruction}"""
 
@@ -91,6 +91,7 @@ DEFAULT_CONFIG = {
     "autoPublishStory": False,
     "autoPublishTikTok": False,
     "autoPublishLinkedIn": False,
+    "autoPublishYouTube": False,
 }
 
 # ─── INIT S3 ──────────────────────────────────────────────────────────────────
@@ -479,11 +480,19 @@ def rewrite_with_ai(raw_text: str, config: dict, run_id: str | None = None):
     temperature = config.get("aiTemperature", 0.7)
     video_style = config.get("videoStyle", "journalism")
     duration_sec = config.get("videoDurationSec", 30)
+    summary_char_target = max(220, int(duration_sec * 11))
+    summary_char_max = max(summary_char_target + 120, int(duration_sec * 14))
     
     # Monta o prompt com estilo e duração dinâmicos
     base_prompt = config.get("systemPrompt") or DEFAULT_SYSTEM_PROMPT
     style_instruction = STYLE_INSTRUCTIONS.get(video_style, STYLE_INSTRUCTIONS["journalism"])
-    system_prompt = base_prompt.replace("{duration_sec}", str(duration_sec)).replace("{style_instruction}", style_instruction)
+    system_prompt = (
+        base_prompt
+        .replace("{duration_sec}", str(duration_sec))
+        .replace("{style_instruction}", style_instruction)
+        .replace("{summary_char_target}", str(summary_char_target))
+        .replace("{summary_char_max}", str(summary_char_max))
+    )
     
     log_pipeline("AI", f"🤖 Modelo: {model_name} | Estilo: {video_style} | Duração alvo: {duration_sec}s")
     log_pipeline("AI", f"🤖 Enviando {len(raw_text[:8000])} chars para {model_name}...")
@@ -529,10 +538,15 @@ def rewrite_with_ai(raw_text: str, config: dict, run_id: str | None = None):
         title = resultado.get('title', 'sem título')
         summary = resultado.get('summary', '')
         content = resultado.get('content_html', '')
+        estimated_duration_sec = max(1, round(len(summary) / 11))
 
         log_pipeline("AI", f"✅ Título gerado: {title[:70]}", "SUCCESS")
         log_pipeline("AI", f"📝 Resumo (roteiro): {summary[:80]}...")
         log_pipeline("AI", f"📄 Artigo HTML: {len(content)} chars gerados")
+        log_pipeline(
+            "AI",
+            f"⏱️ Diagnóstico do roteiro: {len(summary)} chars | estimativa locução ~{estimated_duration_sec}s para meta de {duration_sec}s"
+        )
 
         return resultado, prompt_tokens, completion_tokens, cost
 
@@ -855,6 +869,10 @@ def auto_publish_to_platforms(social_post_id: str | None, config: dict):
     if config.get("autoPublishLinkedIn"):
         log_pipeline("AUTO-PUBLISH", "💼 Auto-publicando no LinkedIn...")
         auto_publish(social_post_id, "/api/social/publish-linkedin")
+
+    if config.get("autoPublishYouTube"):
+        log_pipeline("AUTO-PUBLISH", "▶️ Auto-publicando no YouTube Shorts...")
+        auto_publish(social_post_id, "/api/social/publish-youtube")
 
 
 # ─── PIPELINE PRINCIPAL ───────────────────────────────────────────────────────

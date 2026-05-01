@@ -67,12 +67,12 @@ def render_mp4(project_id: str):
   return res.json()
 
 
-def enqueue_social(qid: str, platform: str):
+def enqueue_social(qid: str, platform: str, post_type: str = "REEL"):
   url = f"{NEXT_BASE_URL}/api/video-questions/{qid}/enqueue-social"
   res = requests.post(
     url,
     headers={"Content-Type": "application/json", "x-worker-secret": SECRET},
-    data=json.dumps({"platform": platform}),
+    data=json.dumps({"platform": platform, "postType": post_type}),
     timeout=30,
   )
   if res.status_code >= 400:
@@ -107,14 +107,16 @@ def process_one(cfg: dict):
     patch_question(qid, {"status": "DONE", "completedAt": datetime.utcnow().isoformat()})
     log(f"✅ Concluído. MP4: {rendered.get('videoUrl')}")
 
-    if cfg.get("autoEnqueueMeta"):
-      enqueue_social(qid, "META")
+    if cfg.get("autoEnqueueMetaReels"):
+      enqueue_social(qid, "META", "REEL")
+    if cfg.get("autoEnqueueMetaStory"):
+      enqueue_social(qid, "META", "STORY")
     if cfg.get("autoEnqueueTikTok"):
-      enqueue_social(qid, "TIKTOK")
+      enqueue_social(qid, "TIKTOK", "REEL")
     if cfg.get("autoEnqueueLinkedIn"):
-      enqueue_social(qid, "LINKEDIN")
+      enqueue_social(qid, "LINKEDIN", "REEL")
     if cfg.get("autoEnqueueYouTube"):
-      enqueue_social(qid, "YOUTUBE")
+      enqueue_social(qid, "YOUTUBE", "REEL")
 
     return True
   except Exception as e:
@@ -151,4 +153,3 @@ def main():
 
 if __name__ == "__main__":
   main()
-
