@@ -29,7 +29,17 @@ NEXT_JS_LOG_URL    = os.environ.get("NEXT_JS_LOG_URL",    f"{NEXT_JS_BASE_URL}/a
 NEXT_JS_CONFIG_URL = f"{NEXT_JS_BASE_URL}/api/worker/config"
 NEXT_JS_RUNS_URL   = f"{NEXT_JS_BASE_URL}/api/worker/runs"
 NEXT_JS_AI_USAGE_URL = f"{NEXT_JS_BASE_URL}/api/worker/ai-usage"
+NEXT_JS_AUTOMATION_CRON_URL = os.environ.get(
+    "NEXT_JS_AUTOMATION_CRON_URL",
+    f"{NEXT_JS_BASE_URL}/api/automation/cron"
+)
 SECRET_CRON_KEY    = os.environ.get("WORKER_SECRET_KEY", "super-secret-worker-key-123")
+CRON_SECRET         = os.environ.get("CRON_SECRET", "")
+AUTOMATION_CRON_ENABLED = os.environ.get("AUTOMATION_CRON_ENABLED", "true").lower() not in ("0", "false", "no", "off")
+AUTOMATION_CRON_INTERVAL_SECONDS = max(
+    60,
+    int(os.environ.get("AUTOMATION_CRON_INTERVAL_SECONDS", "300") or "300")
+)
 FASTAPI_URL        = os.environ.get("FASTAPI_URL", "http://localhost:8000/gerar-video")
 PEXELS_API_KEY     = os.environ.get("PEXELS_API_KEY", "")
 
@@ -126,6 +136,27 @@ def log_pipeline(step: str, message: str, level: str = "INFO"):
 
 # ─── DIAGNÓSTICO DE AMBIENTE ──────────────────────────────────────────────────
 
+def tick_automation_cron():
+    """Chama o cron unificado do Next.js para Mercado Livre + publicacao social."""
+    if not AUTOMATION_CRON_ENABLED:
+        return
+
+    try:
+        params = {}
+        if CRON_SECRET:
+            params["secret"] = CRON_SECRET
+
+        res = requests.get(NEXT_JS_AUTOMATION_CRON_URL, params=params, timeout=30)
+        body = res.text[:500]
+        if res.status_code >= 400:
+            log_pipeline("AUTO_CRON", f"Falha HTTP {res.status_code}: {body}", "WARN")
+            return
+
+        log_pipeline("AUTO_CRON", f"Cron unificado OK: {body[:220]}", "SUCCESS")
+    except Exception as e:
+        log_pipeline("AUTO_CRON", f"Erro chamando cron unificado: {e}", "WARN")
+
+
 def print_env_diagnostics():
     """Imprime e loga todas as configurações críticas ao iniciar."""
     lines = [
@@ -134,6 +165,9 @@ def print_env_diagnostics():
         f"NEXT_JS_INGEST_URL  = {NEXT_JS_INGEST_URL}",
         f"NEXT_JS_SOURCES_URL = {NEXT_JS_SOURCES_URL}",
         f"NEXT_JS_LOG_URL     = {NEXT_JS_LOG_URL}",
+        f"AUTOMATION_CRON_URL = {NEXT_JS_AUTOMATION_CRON_URL}",
+        f"AUTOMATION_CRON     = {'ativado' if AUTOMATION_CRON_ENABLED else 'desativado'} a cada {AUTOMATION_CRON_INTERVAL_SECONDS}s",
+        f"CRON_SECRET         = {'configurado' if CRON_SECRET else 'nao configurado'}",
         f"FASTAPI_URL         = {FASTAPI_URL}",
         f"PEXELS_API_KEY      = {'✅ configurada' if PEXELS_API_KEY else '❌ NÃO configurada'}",
         f"MINIO_ENDPOINT      = {MINIO_ENDPOINT or '❌ NÃO configurado'}",
@@ -977,10 +1011,15 @@ if __name__ == "__main__":
     next_auto_run_time = datetime.now() + timedelta(hours=interval_hours)
 
     first_run = True
+    last_automation_cron_at = 0
     last_scheduled_minute = ""  # Controla que horários fixos não disparem mais de uma vez no mesmo minuto
 
     while True:
         try:
+            if AUTOMATION_CRON_ENABLED and time.time() - last_automation_cron_at >= AUTOMATION_CRON_INTERVAL_SECONDS:
+                tick_automation_cron()
+                last_automation_cron_at = time.time()
+
             # Atualiza config a cada ciclo (permite mudanças sem reiniciar)
             scraper_config = get_scraper_config()
             sources_data = get_dynamic_config()
