@@ -3,6 +3,8 @@ import os
 import platform
 import json
 import math
+import time
+import requests
 import os
 from typing import List, Optional
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
@@ -12,6 +14,8 @@ import pdfplumber
 import edge_tts
 import whisper
 import PIL.Image
+import PIL.ImageDraw
+import numpy as np
 
 # PRE-CONFIGURAÇÃO DO MOVIEPY
 if platform.system() == "Windows":
@@ -20,7 +24,7 @@ if platform.system() == "Windows":
 from moviepy.editor import *
 from moviepy.video.tools.subtitles import SubtitlesClip
 from moviepy.config import change_settings
-from shopee_scraper_service import scrape_shopee_product
+from shopee_scraper_service import scrape_shopee_product, upload_to_minio
 
 # --- PATCH PARA PILLOW 10.0.0+ ---
 if not hasattr(PIL.Image, 'ANTIALIAS'):
@@ -215,6 +219,176 @@ def create_video_logic(audio_path, subtitles_data, output_file,
     final = final.set_mask(None)
     final.write_videofile(output_file, fps=24, codec="libx264", audio_codec="aac", preset="ultrafast")
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FUNÇÕES PARA GERAÇÃO DE VÍDEO TIKTOK (COLETA SHOPEE)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def make_rounded_mask(size: tuple, radius: int) -> ImageClip:
+    """
+    Cria uma máscara retangular com cantos arredondados para o PiP.
+    Retorna um ImageClip em escala de cinza (0-1) para uso como máscara.
+    """
+    img = PIL.Image.new("L", size, 0)
+    draw = PIL.ImageDraw.Draw(img)
+    draw.rounded_rectangle([(0, 0), (size[0] - 1, size[1] - 1)], radius=radius, fill=255)
+    mask_array = np.array(img).astype(float) / 255.0
+    return ImageClip(mask_array, ismask=True)
+
+
+def build_main_background(media_paths: list, total_duration: float, W: int, H: int) -> VideoClip:
+    """
+    Monta o vídeo de fundo com as mídias do produto.
+    Ordem: vídeos primeiro, depois imagens.
+    TODOS os clipes ficam SEM ÁUDIO (áudio do produto é removido).
+    """
+    # Separar e ordenar: vídeos primeiro, imagens depois
+    video_exts = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.m4v'}
+    videos = [p for p in media_paths if os.path.splitext(p)[1].lower() in video_exts]
+    images = [p for p in media_paths if os.path.splitext(p)[1].lower() not in video_exts]
+    ordered = videos + images  # vídeos primeiro, imagens depois
+
+    if not ordered:
+        return ColorClip(size=(W, H), color=(15, 15, 15), duration=total_duration)
+
+    # Duração de cada clip proporcional
+    dur_each = total_duration / len(ordered)
+
+    clips = []
+    for i, path in enumerate(ordered):
+        ext = os.path.splitext(path)[1].lower()
+        try:
+            if ext in video_exts:
+                # Vídeo do produto: remover áudio completamente
+                clip = VideoFileClip(path).without_audio()
+                # Loop se o vídeo for mais curto que a duração alocada
+                if clip.duration < dur_each:
+                    clip = clip.loop(duration=dur_each)
+                else:
+                    clip = clip.subclip(0, dur_each)
+            else:
+                # Imagem: processar e criar clip estático
+                processed = path + f"_bg_{i}.jpg"
+                with PIL.Image.open(path) as im:
+                    im = im.convert("RGB")
+                    im.save(processed, quality=95)
+                clip = ImageClip(processed).set_duration(dur_each)
+
+            # Redimensionar para cobrir o frame 9:16 (cover, sem deformar)
+            cw, ch = clip.size
+            scale = max(W / cw, H / ch)
+            new_w = int(cw * scale)
+            new_h = int(ch * scale)
+            clip = clip.resize((new_w, new_h))
+            # Centralizar no frame
+            x = (W - new_w) // 2
+            y = (H - new_h) // 2
+
+            bg = ColorClip(size=(W, H), color=(0, 0, 0), duration=dur_each)
+            composed = CompositeVideoClip(
+                [bg, clip.set_position((x, y))],
+                size=(W, H)
+            )
+            clips.append(composed)
+        except Exception as e:
+            print(f"[TikTok] Erro ao processar mídia {i} ({path}): {e}")
+            clips.append(ColorClip(size=(W, H), color=(20, 20, 20), duration=dur_each))
+
+    main = concatenate_videoclips(clips)
+    # Ajuste fino de duração
+    if main.duration < total_duration:
+        main = main.set_duration(total_duration)
+    elif main.duration > total_duration:
+        main = main.subclip(0, total_duration)
+    return main.to_RGB()
+
+
+def build_pip_clip(reaction_path: str, pip_w: int, pip_h: int, pip_radius: int) -> VideoClip:
+    """
+    Carrega o vídeo de reação, redimensiona para o quadradinho PiP e
+    aplica máscara com cantos arredondados.
+    O áudio é mantido aqui — será o áudio final do vídeo.
+    """
+    pip = VideoFileClip(reaction_path)
+    # Redimensionar mantendo proporção, preenchendo o quadrado PiP
+    pw, ph = pip.size
+    scale = max(pip_w / pw, pip_h / ph)
+    new_w = int(pw * scale)
+    new_h = int(ph * scale)
+    pip = pip.resize((new_w, new_h))
+    # Crop centralizado no tamanho pip_w x pip_h
+    x_crop = (new_w - pip_w) // 2
+    y_crop = (new_h - pip_h) // 2
+    pip = pip.crop(x1=x_crop, y1=y_crop, x2=x_crop + pip_w, y2=y_crop + pip_h)
+    # Aplicar máscara arredondada
+    mask = make_rounded_mask((pip_w, pip_h), pip_radius)
+    pip = pip.set_mask(mask)
+    return pip
+
+
+def create_tiktok_product_video(
+    media_paths: list,
+    reaction_path: str,
+    output_path: str,
+    pip_fraction: float = 0.30,
+    pip_margin: int = 30,
+    pip_radius: int = 20,
+):
+    """
+    Compõe o vídeo final TikTok (1080×1920):
+      - Fundo: mídias do produto (sem áudio) — vídeos primeiro, depois imagens
+      - Overlay PiP: vídeo de reação no canto inferior direito (com áudio)
+
+    O áudio do vídeo de reação é o único áudio do vídeo final.
+    """
+    W, H = 1080, 1920
+
+    # Carregar vídeo de reação para obter duração e áudio
+    reaction_clip = VideoFileClip(reaction_path)
+    total_duration = reaction_clip.duration
+    reaction_audio = reaction_clip.audio  # será o áudio final
+
+    # Dimensões do PiP (~30% da largura)
+    pip_w = int(W * pip_fraction)
+    pip_h = pip_w  # quadrado
+
+    # Montar fundo com mídias do produto (sem áudio)
+    main_bg = build_main_background(media_paths, total_duration, W, H)
+
+    # Montar PiP (sem áudio por enquanto — adicionamos depois)
+    pip_clip = build_pip_clip(reaction_path, pip_w, pip_h, pip_radius)
+    pip_clip_no_audio = pip_clip.without_audio()
+
+    # Posição PiP: canto inferior direito
+    pip_x = W - pip_w - pip_margin
+    pip_y = H - pip_h - pip_margin
+
+    # Composição final
+    final = CompositeVideoClip(
+        [
+            main_bg,
+            pip_clip_no_audio.set_position((pip_x, pip_y)),
+        ],
+        size=(W, H),
+    )
+
+    # Definir duração e áudio (somente do vídeo de reação)
+    final = final.set_duration(total_duration)
+    if reaction_audio:
+        final = final.set_audio(reaction_audio)
+
+    print(f"[TikTok] Exportando vídeo {W}x{H}, {total_duration:.1f}s → {output_path}")
+    final.write_videofile(
+        output_path,
+        fps=30,
+        codec="libx264",
+        audio_codec="aac",
+        preset="ultrafast",
+        threads=4,
+    )
+    print(f"[TikTok] Vídeo gerado com sucesso: {output_path}")
+
+
 # --- ENDPOINTS ---
 
 @app.post("/transcrever-palavras")
@@ -332,3 +506,103 @@ async def scraping_shopee_endpoint(url: str = Form(...)):
         import traceback
         traceback.print_exc()
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/gerar-video-tiktok")
+async def gerar_video_tiktok_endpoint(
+    coleta_id: str = Form(...),
+    media_urls: str = Form(...),          # JSON array de URLs do MinIO
+    reaction_video: UploadFile = File(...),
+    pip_fraction: float = Form(0.30),     # tamanho PiP: 30% da largura
+    pip_margin: int = Form(30),           # margem do canto (px)
+    pip_radius: int = Form(20),           # raio dos cantos arredondados (px)
+):
+    """
+    Gera um vídeo TikTok (1080×1920) combinando as mídias do produto Shopee com
+    um vídeo de reação em PiP no canto inferior direito.
+
+    Regra de áudio: o áudio do produto é SEMPRE removido.
+    Apenas o áudio do vídeo de reação é mantido no resultado final.
+    """
+    uid = os.urandom(6).hex()
+    work_dir = os.path.join(UPLOAD_DIR, f"tiktok_{coleta_id}_{uid}")
+    os.makedirs(work_dir, exist_ok=True)
+
+    downloaded_paths = []
+    reaction_path = None
+    output_path = os.path.join(OUTPUT_DIR, f"tiktok_{coleta_id}_{uid}.mp4")
+
+    try:
+        # 1. Salvar vídeo de reação enviado pelo usuário
+        reaction_path = os.path.join(work_dir, f"reaction_{reaction_video.filename}")
+        with open(reaction_path, "wb") as f:
+            shutil.copyfileobj(reaction_video.file, f)
+        print(f"[TikTok] Vídeo de reação salvo: {reaction_path}")
+
+        # 2. Fazer download das mídias do produto (URLs do MinIO)
+        urls = json.loads(media_urls)
+        print(f"[TikTok] Fazendo download de {len(urls)} mídias do produto...")
+        for i, item in enumerate(urls):
+            url = item.get("urlMinio") or item if isinstance(item, str) else item.get("url", "")
+            if not url:
+                continue
+            try:
+                resp = requests.get(url, timeout=60, stream=True)
+                resp.raise_for_status()
+                # Determinar extensão pela URL ou content-type
+                ct = resp.headers.get("content-type", "")
+                if "video" in ct or url.lower().endswith((".mp4", ".mov", ".webm")):
+                    ext = ".mp4"
+                else:
+                    ext = ".jpg"
+                local_path = os.path.join(work_dir, f"media_{i}{ext}")
+                with open(local_path, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=65536):
+                        f.write(chunk)
+                downloaded_paths.append(local_path)
+                print(f"[TikTok] Mídia {i} baixada: {local_path}")
+            except Exception as e:
+                print(f"[TikTok] Erro ao baixar mídia {i} ({url}): {e}")
+
+        if not downloaded_paths:
+            return JSONResponse(
+                {"error": "Nenhuma mídia do produto pôde ser baixada."},
+                status_code=400,
+            )
+
+        # 3. Composição do vídeo TikTok
+        print("[TikTok] Iniciando composição do vídeo...")
+        create_tiktok_product_video(
+            media_paths=downloaded_paths,
+            reaction_path=reaction_path,
+            output_path=output_path,
+            pip_fraction=pip_fraction,
+            pip_margin=pip_margin,
+            pip_radius=pip_radius,
+        )
+
+        # 4. Upload do vídeo final para o MinIO
+        minio_key = f"shopee/videos-tiktok/tiktok_{coleta_id}_{uid}.mp4"
+        print(f"[TikTok] Fazendo upload para MinIO: {minio_key}")
+        final_url = upload_to_minio(output_path, minio_key, "video/mp4")
+        print(f"[TikTok] URL final: {final_url}")
+
+        return JSONResponse({
+            "ok": True,
+            "coleta_id": coleta_id,
+            "videoUrl": final_url,
+        })
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+    finally:
+        # Limpeza dos arquivos temporários
+        try:
+            shutil.rmtree(work_dir, ignore_errors=True)
+            if output_path and os.path.exists(output_path):
+                os.remove(output_path)
+        except Exception:
+            pass
