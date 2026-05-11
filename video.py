@@ -45,6 +45,17 @@ OUTPUT_DIR = "temp_outputs"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+@app.on_event("startup")
+async def startup_event():
+    import subprocess
+    print("[Worker] Verificando navegadores Playwright...")
+    try:
+        # Tenta instalar o chromium. Se já existir, ele apenas verifica.
+        subprocess.run(["playwright", "install", "chromium"], check=True)
+        print("[Worker] Playwright pronto.")
+    except Exception as e:
+        print(f"[Worker] Aviso na instalação do Playwright: {e}")
+
 if platform.system() == "Windows":
     change_settings({"IMAGEMAGICK_BINARY": r"magick"})
 
