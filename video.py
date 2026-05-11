@@ -20,6 +20,7 @@ if platform.system() == "Windows":
 from moviepy.editor import *
 from moviepy.video.tools.subtitles import SubtitlesClip
 from moviepy.config import change_settings
+from shopee_scraper_service import scrape_shopee_product
 
 # --- PATCH PARA PILLOW 10.0.0+ ---
 if not hasattr(PIL.Image, 'ANTIALIAS'):
@@ -317,6 +318,16 @@ async def gerar_video_endpoint(
             image_config=img_conf
         )
         return FileResponse(video_path, media_type="video/mp4", filename=f"{base_name}.mp4")
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+@app.post("/scraping-shopee")
+async def scraping_shopee_endpoint(url: str = Form(...)):
+    try:
+        data = await scrape_shopee_product(url)
+        return JSONResponse(data)
     except Exception as e:
         import traceback
         traceback.print_exc()
