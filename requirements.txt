@@ -11,3 +11,5 @@ pdfplumber
 edge-tts
 openai-whisper
 moviepy==1.0.3
+playwright==1.42.0
+langchain-core
