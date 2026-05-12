@@ -551,6 +551,7 @@ async def gerar_video_tiktok_endpoint(
     Apenas o áudio do vídeo de reação é mantido no resultado final.
     """
     uid = os.urandom(6).hex()
+    started_at = time.time()
     work_dir = os.path.join(UPLOAD_DIR, f"tiktok_{coleta_id}_{uid}")
     os.makedirs(work_dir, exist_ok=True)
 

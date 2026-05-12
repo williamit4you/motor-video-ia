@@ -19,6 +19,17 @@ MINIO_SECRET_KEY = os.environ.get("MINIO_SECRET_KEY")
 MINIO_BUCKET_NAME= os.environ.get("MINIO_BUCKET_NAME", "uploads")
 MINIO_PUBLIC_URL = os.environ.get("MINIO_PUBLIC_URL")
 
+print(
+    "[worker][s3] init",
+    {
+        "endpoint": MINIO_ENDPOINT or "MISSING",
+        "bucket": MINIO_BUCKET_NAME,
+        "public_url": MINIO_PUBLIC_URL or "MISSING",
+        "access_key_present": bool(MINIO_ACCESS_KEY),
+        "secret_key_present": bool(MINIO_SECRET_KEY),
+    }
+)
+
 s3_client = None
 if MINIO_ENDPOINT:
     try:
@@ -36,6 +47,18 @@ if MINIO_ENDPOINT:
 def upload_to_minio(file_path: str, object_name: str, content_type: str) -> str:
     if not s3_client:
         raise Exception("S3 client not initialized")
+    file_size = os.path.getsize(file_path) if os.path.exists(file_path) else -1
+    started = time.time()
+    print(
+        "[worker][s3] upload:start",
+        {
+            "endpoint": MINIO_ENDPOINT or "MISSING",
+            "bucket": MINIO_BUCKET_NAME,
+            "object_name": object_name,
+            "content_type": content_type,
+            "file_size": file_size,
+        }
+    )
     with open(file_path, "rb") as f:
         s3_client.put_object(
             Bucket=MINIO_BUCKET_NAME,
@@ -43,6 +66,15 @@ def upload_to_minio(file_path: str, object_name: str, content_type: str) -> str:
             Body=f,
             ContentType=content_type,
         )
+    elapsed = round(time.time() - started, 2)
+    print(
+        "[worker][s3] upload:done",
+        {
+            "object_name": object_name,
+            "elapsed_sec": elapsed,
+            "public_url": f"{MINIO_PUBLIC_URL}/{object_name}",
+        }
+    )
     return f"{MINIO_PUBLIC_URL}/{object_name}"
 
 def generate_sales_prompt(title: str, description: str) -> str:
