@@ -347,13 +347,13 @@ def create_tiktok_product_video(
     pip_radius: int = 20,
 ):
     """
-    Compõe o vídeo final TikTok (1080×1920):
+    Compõe o vídeo final TikTok (720×1280):
       - Fundo: mídias do produto (sem áudio) — vídeos primeiro, depois imagens
       - Overlay PiP: vídeo de reação no canto inferior direito (com áudio)
 
     O áudio do vídeo de reação é o único áudio do vídeo final.
     """
-    W, H = 1080, 1920
+    W, H = 720, 1280
 
     # Carregar vídeo de reação para obter duração e áudio
     reaction_clip = VideoFileClip(reaction_path)
@@ -545,7 +545,7 @@ async def gerar_video_tiktok_endpoint(
     upload_mode: str = Form("worker"),
 ):
     """
-    Gera um vídeo TikTok (1080×1920) combinando as mídias do produto Shopee com
+    Gera um vídeo TikTok (720×1280) combinando as mídias do produto Shopee com
     um vídeo de reação em PiP no canto inferior direito.
 
     Regra de áudio: o áudio do produto é SEMPRE removido.
