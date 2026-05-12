@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y \
     git \
     fonts-liberation \
     libgl1 \
+    libcurl4 \
     && rm -rf /var/lib/apt/lists/*
 
 # Fix para ImageMagick: libera política de segurança

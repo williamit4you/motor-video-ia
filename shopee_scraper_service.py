@@ -1,14 +1,15 @@
 import os
 import asyncio
 import time
-import requests
+import requests as std_requests
+import re
 import boto3
 from urllib.parse import urljoin
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 from dotenv import load_dotenv
-from playwright.async_api import async_playwright
+from curl_cffi import requests
 
 load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
 load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
@@ -60,98 +61,105 @@ Devolva um JSON estrito:
         ("user", f"Título: {title}\nDescrição: {description}")
     ])
     chain = prompt | llm | JsonOutputParser()
-    res = chain.invoke({})
-    return res.get("script_vendas", "")
+    try:
+        res = chain.invoke({})
+        return res.get("script_vendas", "")
+    except:
+        return ""
 
 async def scrape_shopee_product(url: str):
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=['--disable-blink-features=AutomationControlled'])
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
-        )
-        page = await context.new_page()
+    print(f"[Shopee CFFI] Scraping: {url}")
+    
+    # curl_cffi bypasses Datadome perfectly because it impersonates Chrome's TLS fingerprint
+    r = requests.get(url, impersonate="chrome110")
+    html = r.text
+    
+    # Extrair título
+    title = ""
+    title_match = re.search(r'<title>(.*?)</title>', html)
+    if title_match:
+        title = title_match.group(1).replace(" | Shopee Brasil", "").strip()
+
+    # Como não estamos usando navegador completo, extraímos a descrição do meta tag se houver
+    desc = ""
+    desc_match = re.search(r'<meta name="description" content="(.*?)"', html)
+    if desc_match:
+        desc = desc_match.group(1).strip()
         
-        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(3000)
+    # Extrair imagens e vídeos do HTML (a Shopee envia tudo embutido no source para SSR)
+    images = []
+    mp4_urls = []
+    
+    # Pega URLs de imagens jpeg/png da shopee
+    img_matches = re.findall(r'https?:\/\/down-cvs-br\.vod\.susercontent\.com[^\s"\'<>]*(?:\.jpg|\.png|\.webp)', html)
+    if not img_matches:
+        img_matches = re.findall(r'https?:\/\/cf\.shopee\.com\.br\/file\/[a-zA-Z0-9_]+', html)
         
-        try:
-            title = await page.locator("div[class*='page-product'] h1, h1").first.text_content()
-        except:
-            title = await page.title()
+    for img_url in img_matches:
+        clean = img_url.replace('\\', '')
+        if clean not in images:
+            images.append(clean)
             
-        try:
-            desc = await page.locator("div[class*='product-detail']").text_content()
-            if not desc:
-                desc = await page.locator("div[style*='white-space: pre-wrap']").first.text_content()
-        except:
-            desc = ""
+    # Procurar por URLs de MP4
+    mp4_matches = re.findall(r'https?:\/\/[^\s"\'<>]*\.mp4[^\s"\'<>]*', html)
+    for v_url in mp4_matches:
+        clean = v_url.replace('\\', '')
+        if ".mp4" in clean and clean not in mp4_urls:
+            mp4_urls.append(clean)
             
+    video = mp4_urls[0] if mp4_urls else None
+    
+    # Se não conseguimos título pela tag title, damos um fallback
+    if not title:
+        title = "Produto Shopee"
+
+    uploaded_media = []
+    os.makedirs("temp_uploads", exist_ok=True)
+    
+    # Limit to 5 images max
+    for i, img_url in enumerate(images[:5]):
         try:
-            images = await page.evaluate("""() => {
-                return Array.from(document.querySelectorAll('picture img')).map(img => img.src).filter(src => src.includes('http'));
-            }""")
-            images = list(dict.fromkeys(images)) # remove duplicates
-        except:
-            images = []
-            
-        try:
-            video = await page.evaluate("""() => {
-                let v = document.querySelector('video');
-                return v ? v.src : null;
-            }""")
-        except:
-            video = None
-            
-        await browser.close()
-        
-        # Download and upload media
-        uploaded_media = []
-        os.makedirs("temp_uploads", exist_ok=True)
-        
-        # Limit to 5 images max
-        for i, img_url in enumerate(images[:5]):
-            try:
-                res = requests.get(img_url, timeout=30)
-                if res.status_code == 200:
-                    ext = "jpg"
-                    if "png" in img_url: ext = "png"
-                    elif "webp" in img_url: ext = "webp"
-                    
-                    filename = f"temp_uploads/shopee_img_{int(time.time())}_{i}.{ext}"
-                    with open(filename, "wb") as f:
-                        f.write(res.content)
-                    
-                    minio_url = upload_to_minio(filename, f"shopee/images/{os.path.basename(filename)}", f"image/{ext}")
-                    uploaded_media.append({"tipo": "IMAGE", "url": minio_url})
-                    os.remove(filename)
-            except Exception as e:
-                print("Error uploading image:", e)
+            res = std_requests.get(img_url, timeout=30)
+            if res.status_code == 200:
+                ext = "jpg"
+                if "png" in img_url: ext = "png"
+                elif "webp" in img_url: ext = "webp"
                 
-        if video:
-            try:
-                res = requests.get(video, timeout=60, stream=True)
-                if res.status_code == 200:
-                    filename = f"temp_uploads/shopee_vid_{int(time.time())}.mp4"
-                    with open(filename, "wb") as f:
-                        for chunk in res.iter_content(chunk_size=65536):
-                            f.write(chunk)
-                    
-                    minio_url = upload_to_minio(filename, f"shopee/videos/{os.path.basename(filename)}", "video/mp4")
-                    uploaded_media.append({"tipo": "VIDEO", "url": minio_url})
-                    os.remove(filename)
-            except Exception as e:
-                print("Error uploading video:", e)
+                filename = f"temp_uploads/shopee_img_{int(time.time())}_{i}.{ext}"
+                with open(filename, "wb") as f:
+                    f.write(res.content)
                 
-        try:
-            ai_prompt = generate_sales_prompt(title, desc)
+                minio_url = upload_to_minio(filename, f"shopee/images/{os.path.basename(filename)}", f"image/{ext}")
+                uploaded_media.append({"tipo": "IMAGE", "url": minio_url})
+                os.remove(filename)
         except Exception as e:
-            print("Error generating AI prompt:", e)
-            ai_prompt = ""
+            print("Error uploading image:", e)
             
-        return {
-            "titulo": title.strip() if title else "",
-            "descricao": desc.strip() if desc else "",
-            "detalhes": desc[:500] if desc else "", # Using part of desc as details
-            "aiPromptVendas": ai_prompt,
-            "linksMedia": uploaded_media
-        }
+    if video:
+        try:
+            res = std_requests.get(video, timeout=60, stream=True)
+            if res.status_code == 200:
+                filename = f"temp_uploads/shopee_vid_{int(time.time())}.mp4"
+                with open(filename, "wb") as f:
+                    for chunk in res.iter_content(chunk_size=65536):
+                        f.write(chunk)
+                
+                minio_url = upload_to_minio(filename, f"shopee/videos/{os.path.basename(filename)}", "video/mp4")
+                uploaded_media.append({"tipo": "VIDEO", "url": minio_url})
+                os.remove(filename)
+        except Exception as e:
+            print("Error uploading video:", e)
+            
+    try:
+        ai_prompt = generate_sales_prompt(title, desc)
+    except Exception as e:
+        print("Error generating AI prompt:", e)
+        ai_prompt = ""
+        
+    return {
+        "titulo": title.strip() if title else "",
+        "descricao": desc.strip() if desc else "",
+        "detalhes": desc[:500] if desc else "", 
+        "aiPromptVendas": ai_prompt,
+        "linksMedia": uploaded_media
+    }
