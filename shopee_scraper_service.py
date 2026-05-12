@@ -1,6 +1,8 @@
 import os
 import re
 import time
+import json
+import html as html_lib
 import requests as std_requests
 import boto3
 from botocore.config import Config
@@ -102,6 +104,77 @@ Devolva um JSON estrito:
     except:
         return ""
 
+def _clean_text(value: str) -> str:
+    return re.sub(r"\s+", " ", html_lib.unescape(str(value or "")).replace("\u00a0", " ")).strip()
+
+def _strip_html(value: str) -> str:
+    return _clean_text(re.sub(r"<[^>]+>", " ", str(value or "")))
+
+def _extract_meta(html: str, key: str, attr: str = "property") -> str:
+    escaped = re.escape(key)
+    match = re.search(rf'<meta[^>]+{attr}=["\']{escaped}["\'][^>]+content=["\']([^"\']*)["\']', html, re.IGNORECASE)
+    return _clean_text(match.group(1)) if match else ""
+
+def _extract_json_ld_product(html: str) -> dict:
+    blocks = re.findall(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>([\s\S]*?)</script>', html, re.IGNORECASE)
+
+    def visit(node):
+        if isinstance(node, list):
+            for item in node:
+                found = visit(item)
+                if found:
+                    return found
+        elif isinstance(node, dict):
+            if str(node.get("@type", "")).lower() == "product":
+                return node
+            for value in node.values():
+                found = visit(value)
+                if found:
+                    return found
+        return None
+
+    for block in blocks:
+        try:
+            parsed = json.loads(block)
+            found = visit(parsed)
+            if found:
+                return found
+        except Exception:
+            continue
+    return {}
+
+def _extract_section_by_heading(html: str, headings: list[str]) -> str:
+    for heading in headings:
+        escaped = re.escape(heading)
+        match = re.search(rf'{escaped}[\s\S]{{0,300}}?<div[^>]*>([\s\S]{{20,3000}}?)</div>', html, re.IGNORECASE)
+        if match:
+            text = _strip_html(match.group(1))
+            if text:
+                return text
+    return ""
+
+def _extract_attribute_pairs(html: str) -> str:
+    pairs = []
+    for name, value in re.findall(r'"name"\s*:\s*"([^"]{2,80})"\s*,\s*"value"\s*:\s*"([^"]{1,180})"', html, re.IGNORECASE):
+        clean_name = _clean_text(name)
+        clean_value = _clean_text(value)
+        if clean_name and clean_value and clean_name.lower() not in {"name", "title"}:
+            pairs.append(f"{clean_name}: {clean_value}")
+        if len(pairs) >= 12:
+            break
+    return " | ".join(dict.fromkeys(pairs))
+
+def _build_fallback_sales_prompt(title: str, description: str, details: str) -> str:
+    base = description or details
+    if not base:
+        base = f"Produto: {title}."
+    snippet = _clean_text(base)[:220]
+    return (
+        f"Se voce procura {title}, presta atencao nisso. {snippet} "
+        "E uma opcao que chama atencao pelo custo-beneficio e pode resolver o que muita gente procura no dia a dia. "
+        "Para ter acesso ao produto, o link esta na bio!"
+    ).strip()
+
 def _extract_shopee_raw(url: str) -> dict:
     """
     Uses curl_cffi to bypass Datadome TLS fingerprint detection.
@@ -146,16 +219,27 @@ def _extract_shopee_raw(url: str) -> dict:
         if m:
             title = re.sub(r'\s*[\|\-]\s*Shopee.*$', m.group(1), flags=re.IGNORECASE).strip()
 
-    # Extract description from meta tags
-    desc = ""
-    for pattern in [
-        r'<meta\s+property="og:description"\s+content="([^"]*)"',
-        r'<meta\s+name="description"\s+content="([^"]*)"',
-    ]:
-        m = re.search(pattern, html, re.IGNORECASE)
-        if m:
-            desc = m.group(1).strip()
-            break
+    json_ld_product = _extract_json_ld_product(html)
+
+    desc = _clean_text(
+        _extract_meta(html, "og:description")
+        or _extract_meta(html, "description", attr="name")
+        or json_ld_product.get("description", "")
+        or _extract_section_by_heading(html, ["Descrição do Produto", "Descricao do Produto", "Descricao", "Product Description"])
+    )
+
+    detalhes = _clean_text(
+        _extract_attribute_pairs(html)
+        or _extract_section_by_heading(
+            html,
+            [
+                "Detalhes do Produto",
+                "Caracteristicas do Produto",
+                "Especificacoes",
+                "Informacoes do Produto",
+            ],
+        )
+    )
 
     # Extract MP4 video URLs (Shopee embeds them in SSR HTML)
     mp4_urls = []
@@ -184,6 +268,7 @@ def _extract_shopee_raw(url: str) -> dict:
     return {
         "titulo": title,
         "descricao": desc,
+        "detalhes": detalhes,
         "videoRawUrl": video_url,
         "imageRawUrls": img_urls[:5],
     }
@@ -203,6 +288,7 @@ async def scrape_shopee_product(url: str):
     raw = _extract_shopee_raw(url)
     title = raw["titulo"] or "Produto Shopee"
     desc = raw["descricao"]
+    details = raw.get("detalhes", "")
     video_url = raw["videoRawUrl"]
     img_urls = raw["imageRawUrls"]
 
@@ -240,15 +326,18 @@ async def scrape_shopee_product(url: str):
             print("Error uploading video:", e)
 
     try:
-        ai_prompt = generate_sales_prompt(title, desc)
+        ai_prompt = generate_sales_prompt(title, f"{desc}\n{details}".strip())
     except Exception as e:
         print("Error generating AI prompt:", e)
         ai_prompt = ""
 
+    if not ai_prompt:
+        ai_prompt = _build_fallback_sales_prompt(title, desc, details)
+
     return {
         "titulo": title.strip(),
         "descricao": desc.strip(),
-        "detalhes": desc[:500],
+        "detalhes": details.strip()[:2000],
         "aiPromptVendas": ai_prompt,
         "linksMedia": uploaded_media
     }
