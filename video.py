@@ -236,6 +236,18 @@ def make_rounded_mask(size: tuple, radius: int) -> ImageClip:
     return ImageClip(mask_array, ismask=True)
 
 
+def resolve_media_url(item) -> str:
+    """
+    Aceita string simples ou objeto vindo do banco/Next.
+    Prioriza urlMinio, depois url.
+    """
+    if isinstance(item, str):
+        return item.strip()
+    if isinstance(item, dict):
+        return str(item.get("urlMinio") or item.get("url") or "").strip()
+    return ""
+
+
 def build_main_background(media_paths: list, total_duration: float, W: int, H: int) -> VideoClip:
     """
     Monta o vídeo de fundo com as mídias do produto.
@@ -557,7 +569,7 @@ async def gerar_video_tiktok_endpoint(
         urls = json.loads(media_urls)
         print(f"[TikTok] Fazendo download de {len(urls)} mídias do produto...")
         for i, item in enumerate(urls):
-            url = item.get("urlMinio") or item if isinstance(item, str) else item.get("url", "")
+            url = resolve_media_url(item)
             if not url:
                 continue
             try:
