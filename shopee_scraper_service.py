@@ -3,6 +3,7 @@ import re
 import time
 import requests as std_requests
 import boto3
+from botocore.config import Config
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
@@ -12,7 +13,7 @@ from curl_cffi import requests
 load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
 load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
 
-MINIO_ENDPOINT   = os.environ.get("MINIO_ENDPOINT")
+MINIO_ENDPOINT   = os.environ.get("MINIO_INTERNAL_ENDPOINT") or os.environ.get("MINIO_ENDPOINT")
 MINIO_ACCESS_KEY = os.environ.get("MINIO_ACCESS_KEY")
 MINIO_SECRET_KEY = os.environ.get("MINIO_SECRET_KEY")
 MINIO_BUCKET_NAME= os.environ.get("MINIO_BUCKET_NAME", "uploads")
@@ -26,7 +27,8 @@ if MINIO_ENDPOINT:
             endpoint_url=MINIO_ENDPOINT,
             aws_access_key_id=MINIO_ACCESS_KEY,
             aws_secret_access_key=MINIO_SECRET_KEY,
-            region_name='us-east-1'
+            region_name='us-east-1',
+            config=Config(signature_version='s3v4', s3={'addressing_style': 'path'})
         )
     except Exception as e:
         print("S3 init error:", e)
@@ -34,10 +36,13 @@ if MINIO_ENDPOINT:
 def upload_to_minio(file_path: str, object_name: str, content_type: str) -> str:
     if not s3_client:
         raise Exception("S3 client not initialized")
-    s3_client.upload_file(
-        file_path, MINIO_BUCKET_NAME, object_name,
-        ExtraArgs={'ContentType': content_type}
-    )
+    with open(file_path, "rb") as f:
+        s3_client.put_object(
+            Bucket=MINIO_BUCKET_NAME,
+            Key=object_name,
+            Body=f,
+            ContentType=content_type,
+        )
     return f"{MINIO_PUBLIC_URL}/{object_name}"
 
 def generate_sales_prompt(title: str, description: str) -> str:
