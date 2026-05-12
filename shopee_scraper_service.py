@@ -1,14 +1,12 @@
 import os
-import asyncio
+import re
 import time
 import requests as std_requests
-import re
 import boto3
-from urllib.parse import urljoin
+from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
-from dotenv import load_dotenv
 from curl_cffi import requests
 
 load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
@@ -67,99 +65,153 @@ Devolva um JSON estrito:
     except:
         return ""
 
-async def scrape_shopee_product(url: str):
-    print(f"[Shopee CFFI] Scraping: {url}")
-    
-    # curl_cffi bypasses Datadome perfectly because it impersonates Chrome's TLS fingerprint
-    r = requests.get(url, impersonate="chrome110")
-    html = r.text
-    
-    # Extrair título
-    title = ""
-    title_match = re.search(r'<title>(.*?)</title>', html)
-    if title_match:
-        title = title_match.group(1).replace(" | Shopee Brasil", "").strip()
+def _extract_shopee_raw(url: str) -> dict:
+    """
+    Uses curl_cffi to bypass Datadome TLS fingerprint detection.
+    Returns raw (not yet uploaded) video/image URLs from the Shopee product page.
+    This function does NOT upload to MinIO — the caller is responsible for that.
+    """
+    print(f"[Shopee CFFI] Fetching: {url}")
 
-    # Como não estamos usando navegador completo, extraímos a descrição do meta tag se houver
-    desc = ""
-    desc_match = re.search(r'<meta name="description" content="(.*?)"', html)
-    if desc_match:
-        desc = desc_match.group(1).strip()
-        
-    # Extrair imagens e vídeos do HTML (a Shopee envia tudo embutido no source para SSR)
-    images = []
-    mp4_urls = []
-    
-    # Pega URLs de imagens jpeg/png da shopee
-    img_matches = re.findall(r'https?:\/\/down-cvs-br\.vod\.susercontent\.com[^\s"\'<>]*(?:\.jpg|\.png|\.webp)', html)
-    if not img_matches:
-        img_matches = re.findall(r'https?:\/\/cf\.shopee\.com\.br\/file\/[a-zA-Z0-9_]+', html)
-        
-    for img_url in img_matches:
-        clean = img_url.replace('\\', '')
-        if clean not in images:
-            images.append(clean)
-            
-    # Procurar por URLs de MP4
-    mp4_matches = re.findall(r'https?:\/\/[^\s"\'<>]*\.mp4[^\s"\'<>]*', html)
-    for v_url in mp4_matches:
-        clean = v_url.replace('\\', '')
-        if ".mp4" in clean and clean not in mp4_urls:
-            mp4_urls.append(clean)
-            
-    video = mp4_urls[0] if mp4_urls else None
-    
-    # Se não conseguimos título pela tag title, damos um fallback
+    # curl_cffi impersonates Chrome 110 TLS fingerprint — bypasses Datadome on cloud IPs
+    r = requests.get(
+        url,
+        impersonate="chrome110",
+        headers={
+            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "accept-language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+            "accept-encoding": "gzip, deflate, br",
+            "referer": "https://shopee.com.br/",
+        },
+        timeout=30
+    )
+    html = r.text
+    print(f"[Shopee CFFI] HTML length: {len(html)}, status: {r.status_code}")
+
+    # Extract title — og:title is the real product name; <title> is often "Shopping Cart Icon"
+    title = ""
+    for pattern in [
+        r'<meta\s+property="og:title"\s+content="([^"]+)"',
+        r'<meta\s+name="og:title"\s+content="([^"]+)"',
+        r'"name"\s*:\s*"([^"]{10,}?)"',   # JSON-LD product name fallback
+    ]:
+        m = re.search(pattern, html, re.IGNORECASE)
+        if m:
+            candidate = m.group(1).strip()
+            # Skip generic titles
+            if candidate and "Shopping Cart" not in candidate and "Shopee" not in candidate:
+                title = re.sub(r'\s*[\|\-]\s*Shopee.*$', '', candidate, flags=re.IGNORECASE).strip()
+                break
+
+    # If still empty, try <title> as last resort
     if not title:
-        title = "Produto Shopee"
+        m = re.search(r'<title>(.*?)</title>', html)
+        if m:
+            title = re.sub(r'\s*[\|\-]\s*Shopee.*$', m.group(1), flags=re.IGNORECASE).strip()
+
+    # Extract description from meta tags
+    desc = ""
+    for pattern in [
+        r'<meta\s+property="og:description"\s+content="([^"]*)"',
+        r'<meta\s+name="description"\s+content="([^"]*)"',
+    ]:
+        m = re.search(pattern, html, re.IGNORECASE)
+        if m:
+            desc = m.group(1).strip()
+            break
+
+    # Extract MP4 video URLs (Shopee embeds them in SSR HTML)
+    mp4_urls = []
+    for raw in re.findall(r'https?://[^\s"\'<>]*\.mp4[^\s"\'<>]*', html):
+        clean = raw.replace('\\u002F', '/').replace('\\/', '/').rstrip('\\')
+        if '.mp4' in clean and clean not in mp4_urls:
+            mp4_urls.append(clean)
+
+    # Extract image URLs from susercontent CDN — explicitly EXCLUDE .mp4 files
+    img_urls = []
+    for pattern in [
+        r'(https?://down-[a-z]+-[a-z]+\.img\.susercontent\.com/file/[a-zA-Z0-9_\-]+)',
+        r'(https?://[a-z0-9\-]+\.img\.susercontent\.com/file/[a-zA-Z0-9_\-]+)',
+        r'(https?://cf\.shopee\.com\.br/file/[a-zA-Z0-9_\-]+)',
+    ]:
+        for raw in re.findall(pattern, html):
+            clean = raw.replace('\\u002F', '/').replace('\\/', '/').rstrip('\\')
+            # Skip if it's actually an mp4 URL
+            if '.mp4' not in clean and clean not in img_urls:
+                img_urls.append(clean)
+
+    video_url = mp4_urls[0] if mp4_urls else None
+
+    print(f"[Shopee CFFI] Title: '{title}' | Video: {bool(video_url)} | Images: {len(img_urls)}")
+
+    return {
+        "titulo": title,
+        "descricao": desc,
+        "videoRawUrl": video_url,
+        "imageRawUrls": img_urls[:5],
+    }
+
+async def scrape_shopee_raw(url: str) -> dict:
+    """
+    Endpoint for render-service: returns raw URLs without MinIO upload.
+    The render-service (which has MinIO creds) handles the upload.
+    """
+    return _extract_shopee_raw(url)
+
+async def scrape_shopee_product(url: str):
+    """
+    Full pipeline: extract raw URLs + upload to MinIO + generate AI script.
+    Used by the /scraping-shopee FastAPI endpoint in video.py.
+    """
+    raw = _extract_shopee_raw(url)
+    title = raw["titulo"] or "Produto Shopee"
+    desc = raw["descricao"]
+    video_url = raw["videoRawUrl"]
+    img_urls = raw["imageRawUrls"]
 
     uploaded_media = []
     os.makedirs("temp_uploads", exist_ok=True)
-    
-    # Limit to 5 images max
-    for i, img_url in enumerate(images[:5]):
+
+    # Upload images to MinIO
+    for i, img_url in enumerate(img_urls):
         try:
             res = std_requests.get(img_url, timeout=30)
             if res.status_code == 200:
-                ext = "jpg"
-                if "png" in img_url: ext = "png"
-                elif "webp" in img_url: ext = "webp"
-                
+                ext = "webp" if "webp" in img_url else "png" if "png" in img_url else "jpg"
                 filename = f"temp_uploads/shopee_img_{int(time.time())}_{i}.{ext}"
                 with open(filename, "wb") as f:
                     f.write(res.content)
-                
                 minio_url = upload_to_minio(filename, f"shopee/images/{os.path.basename(filename)}", f"image/{ext}")
                 uploaded_media.append({"tipo": "IMAGE", "url": minio_url})
                 os.remove(filename)
         except Exception as e:
             print("Error uploading image:", e)
-            
-    if video:
+
+    # Upload video to MinIO
+    if video_url:
         try:
-            res = std_requests.get(video, timeout=60, stream=True)
+            res = std_requests.get(video_url, timeout=90, stream=True)
             if res.status_code == 200:
                 filename = f"temp_uploads/shopee_vid_{int(time.time())}.mp4"
                 with open(filename, "wb") as f:
                     for chunk in res.iter_content(chunk_size=65536):
                         f.write(chunk)
-                
                 minio_url = upload_to_minio(filename, f"shopee/videos/{os.path.basename(filename)}", "video/mp4")
                 uploaded_media.append({"tipo": "VIDEO", "url": minio_url})
                 os.remove(filename)
         except Exception as e:
             print("Error uploading video:", e)
-            
+
     try:
         ai_prompt = generate_sales_prompt(title, desc)
     except Exception as e:
         print("Error generating AI prompt:", e)
         ai_prompt = ""
-        
+
     return {
-        "titulo": title.strip() if title else "",
-        "descricao": desc.strip() if desc else "",
-        "detalhes": desc[:500] if desc else "", 
+        "titulo": title.strip(),
+        "descricao": desc.strip(),
+        "detalhes": desc[:500],
         "aiPromptVendas": ai_prompt,
         "linksMedia": uploaded_media
     }

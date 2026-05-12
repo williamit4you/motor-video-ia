@@ -24,7 +24,7 @@ if platform.system() == "Windows":
 from moviepy.editor import *
 from moviepy.video.tools.subtitles import SubtitlesClip
 from moviepy.config import change_settings
-from shopee_scraper_service import scrape_shopee_product, upload_to_minio
+from shopee_scraper_service import scrape_shopee_product, scrape_shopee_raw, upload_to_minio
 
 # --- PATCH PARA PILLOW 10.0.0+ ---
 if not hasattr(PIL.Image, 'ANTIALIAS'):
@@ -501,6 +501,20 @@ async def gerar_video_endpoint(
 async def scraping_shopee_endpoint(url: str = Form(...)):
     try:
         data = await scrape_shopee_product(url)
+        return JSONResponse(data)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+@app.post("/scraping-shopee-raw")
+async def scraping_shopee_raw_endpoint(url: str = Form(...)):
+    """
+    Returns raw video/image URLs found in the Shopee page (no MinIO upload).
+    Designed to be called by the render-service which has its own MinIO credentials.
+    """
+    try:
+        data = await scrape_shopee_raw(url)
         return JSONResponse(data)
     except Exception as e:
         import traceback
