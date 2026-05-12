@@ -8,7 +8,7 @@ import requests
 import os
 from typing import List, Optional
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 import pdfplumber
 import edge_tts
@@ -542,6 +542,7 @@ async def gerar_video_tiktok_endpoint(
     pip_fraction: float = Form(0.30),     # tamanho PiP: 30% da largura
     pip_margin: int = Form(30),           # margem do canto (px)
     pip_radius: int = Form(20),           # raio dos cantos arredondados (px)
+    upload_mode: str = Form("worker"),
 ):
     """
     Gera um vídeo TikTok (1080×1920) combinando as mídias do produto Shopee com
@@ -609,6 +610,16 @@ async def gerar_video_tiktok_endpoint(
         )
 
         # 4. Upload do vídeo final para o MinIO
+        if str(upload_mode).strip().lower() == "external":
+            with open(output_path, "rb") as f:
+                video_bytes = f.read()
+            print(f"[TikTok] Retornando MP4 para upload externo: {len(video_bytes)} bytes")
+            return Response(
+                content=video_bytes,
+                media_type="video/mp4",
+                headers={"X-Coleta-Id": coleta_id, "X-TikTok-Uid": uid},
+            )
+
         minio_key = f"shopee/videos-tiktok/tiktok_{coleta_id}_{uid}.mp4"
         print(f"[TikTok] Fazendo upload para MinIO: {minio_key}")
         final_url = upload_to_minio(output_path, minio_key, "video/mp4")
