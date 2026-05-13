@@ -247,6 +247,32 @@ def resolve_media_url(item) -> str:
         return str(item.get("urlMinio") or item.get("url") or "").strip()
     return ""
 
+def fit_cover(clip: VideoClip, W: int, H: int) -> VideoClip:
+    """
+    Redimensiona o clipe para cobrir WxH sem distorcer (crop central).
+    """
+    try:
+        cw, ch = clip.size
+        if not cw or not ch:
+            return clip
+        scale = max(W / cw, H / ch)
+        new_w = int(cw * scale)
+        new_h = int(ch * scale)
+        resized = clip.resize((new_w, new_h))
+        x = (new_w - W) // 2
+        y = (new_h - H) // 2
+        return resized.crop(x1=x, y1=y, x2=x + W, y2=y + H)
+    except Exception:
+        return clip
+
+def download_to_file(url: str, target_path: str, timeout: int = 120) -> None:
+    with requests.get(url, timeout=timeout, stream=True) as resp:
+        resp.raise_for_status()
+        with open(target_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+
 
 def build_main_background(media_paths: list, total_duration: float, W: int, H: int) -> VideoClip:
     """
@@ -641,6 +667,79 @@ async def gerar_video_tiktok_endpoint(
         try:
             shutil.rmtree(work_dir, ignore_errors=True)
             if output_path and os.path.exists(output_path):
+                os.remove(output_path)
+        except Exception:
+            pass
+
+
+@app.post("/merge-videos")
+async def merge_videos_endpoint(
+    coleta_id: str = Form(...),
+    original_video_url: str = Form(...),
+    copy_video_url: str = Form(...),
+    upload_mode: str = Form("worker"),
+):
+    """
+    Une (concatena) o vÃ­deo original do produto (sem Ã¡udio) com o vÃ­deo da copy (com Ã¡udio).
+    SaÃ­da: MP4 vertical 1080x1920.
+    """
+    uid = os.urandom(6).hex()
+    started_at = time.time()
+    work_dir = os.path.join(UPLOAD_DIR, f"merge_{coleta_id}_{uid}")
+    os.makedirs(work_dir, exist_ok=True)
+
+    original_path = os.path.join(work_dir, "original.mp4")
+    copy_path = os.path.join(work_dir, "copy.mp4")
+    output_path = os.path.join(OUTPUT_DIR, f"merge_{coleta_id}_{uid}.mp4")
+
+    try:
+        orig_url = str(original_video_url or "").strip()
+        copy_url = str(copy_video_url or "").strip()
+        if not orig_url or not copy_url:
+            return JSONResponse({"error": "original_video_url e copy_video_url sao obrigatorios."}, status_code=400)
+
+        print("[Merge] Baixando vÃ­deos...", {"coleta_id": coleta_id, "uid": uid})
+        download_to_file(orig_url, original_path, timeout=180)
+        download_to_file(copy_url, copy_path, timeout=180)
+
+        W, H = 1080, 1920
+        original_clip = fit_cover(VideoFileClip(original_path).without_audio(), W, H)
+        copy_clip = fit_cover(VideoFileClip(copy_path), W, H)
+
+        final = concatenate_videoclips([original_clip, copy_clip], method="compose")
+        print(f"[Merge] Exportando MP4 {W}x{H} -> {output_path}")
+        final.write_videofile(
+            output_path,
+            fps=30,
+            codec="libx264",
+            audio_codec="aac",
+            preset="ultrafast",
+            threads=4,
+        )
+
+        elapsed = int((time.time() - started_at) * 1000)
+        print("[Merge] OK", {"coleta_id": coleta_id, "elapsed_ms": elapsed})
+
+        if str(upload_mode).strip().lower() == "external":
+            with open(output_path, "rb") as f:
+                video_bytes = f.read()
+            return Response(
+                content=video_bytes,
+                media_type="video/mp4",
+                headers={"X-Coleta-Id": coleta_id, "X-Merge-Uid": uid},
+            )
+
+        minio_key = f"shopee/videos-merged/merged_{coleta_id}_{uid}.mp4"
+        final_url = upload_to_minio(output_path, minio_key, "video/mp4")
+        return JSONResponse({"ok": True, "coleta_id": coleta_id, "videoUrl": final_url})
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse({"error": str(e)}, status_code=500)
+    finally:
+        try:
+            shutil.rmtree(work_dir, ignore_errors=True)
+            if os.path.exists(output_path):
                 os.remove(output_path)
         except Exception:
             pass
