@@ -678,10 +678,16 @@ async def merge_videos_endpoint(
     original_video_url: str = Form(...),
     copy_video_url: str = Form(...),
     upload_mode: str = Form("worker"),
+    pip_fraction: float = Form(0.30),   # tamanho do PiP: 30% da largura
+    pip_margin: int = Form(30),          # margem do canto inferior direito (px)
+    pip_radius: int = Form(20),          # raio dos cantos arredondados (px)
 ):
     """
-    Une (concatena) o vÃ­deo original do produto (sem Ã¡udio) com o vÃ­deo da copy (com Ã¡udio).
-    SaÃ­da: MP4 vertical 1080x1920.
+    Gera o vídeo final de propaganda em formato TikTok/Reels/Shorts (1080x1920):
+      - Fundo: vídeo original do produto (sem áudio), em loop se necessário
+      - PiP: vídeo de reação/copy da IA no canto inferior direito (com áudio)
+
+    O áudio do produto é SEMPRE removido. Apenas o áudio do vídeo copy/IA é mantido.
     """
     uid = os.urandom(6).hex()
     started_at = time.time()
@@ -698,27 +704,25 @@ async def merge_videos_endpoint(
         if not orig_url or not copy_url:
             return JSONResponse({"error": "original_video_url e copy_video_url sao obrigatorios."}, status_code=400)
 
-        print("[Merge] Baixando vÃ­deos...", {"coleta_id": coleta_id, "uid": uid})
+        print("[Merge] Baixando vídeos para composição PiP...", {"coleta_id": coleta_id, "uid": uid})
         download_to_file(orig_url, original_path, timeout=180)
         download_to_file(copy_url, copy_path, timeout=180)
 
-        W, H = 1080, 1920
-        original_clip = fit_cover(VideoFileClip(original_path).without_audio(), W, H)
-        copy_clip = fit_cover(VideoFileClip(copy_path), W, H)
-
-        final = concatenate_videoclips([original_clip, copy_clip], method="compose")
-        print(f"[Merge] Exportando MP4 {W}x{H} -> {output_path}")
-        final.write_videofile(
-            output_path,
-            fps=30,
-            codec="libx264",
-            audio_codec="aac",
-            preset="ultrafast",
-            threads=4,
+        print(f"[Merge] Iniciando composição PiP: original={original_path}, copy(PiP)={copy_path}")
+        # Usa a mesma lógica de composição PiP do endpoint /gerar-video-tiktok:
+        # - vídeo original: fundo (sem áudio)
+        # - vídeo copy/IA: PiP no canto inferior direito (com áudio)
+        create_tiktok_product_video(
+            media_paths=[original_path],
+            reaction_path=copy_path,
+            output_path=output_path,
+            pip_fraction=pip_fraction,
+            pip_margin=pip_margin,
+            pip_radius=pip_radius,
         )
 
         elapsed = int((time.time() - started_at) * 1000)
-        print("[Merge] OK", {"coleta_id": coleta_id, "elapsed_ms": elapsed})
+        print("[Merge] PiP concluído", {"coleta_id": coleta_id, "elapsed_ms": elapsed})
 
         if str(upload_mode).strip().lower() == "external":
             with open(output_path, "rb") as f:
